@@ -1,6 +1,6 @@
-# ART — ASCII Dungeon Escape with Cyberpunk Hacking
+# ARTHACK — ASCII Dungeon Escape with Cyberpunk Hacking
 
-**ART** is a terminal ASCII roguelike where medieval dungeon-crawling meets real-world penetration testing techniques. Fight guards, loot treasure, socket gems into weapons and backpacks, and hack castle computer terminals using actual MITRE ATT&CK TTPs.
+**ARTHACK** is a terminal ASCII roguelike where medieval dungeon-crawling meets real-world penetration testing techniques. Fight guards, loot treasure, socket gems into weapons and backpacks, and hack castle computer terminals using actual MITRE ATT&CK TTPs.
 
 ```
 ########################################
