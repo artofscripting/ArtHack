@@ -1,0 +1,372 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>ART — ASCII Dungeon Escape</title>
+
+  <!-- xterm.js -->
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.min.css" />
+  <script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/xterm-addon-web-links@0.9.0/lib/xterm-addon-web-links.min.js"></script>
+
+  <!-- Socket.IO -->
+  <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
+
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg:       #0a0a0f;
+      --surface:  #111118;
+      --border:   #1e1e2e;
+      --green:    #00ff88;
+      --cyan:     #00ccff;
+      --amber:    #ffaa00;
+      --red:      #ff3355;
+      --text-dim: #445566;
+    }
+
+    html, body {
+      height: 100%;
+      background: var(--bg);
+      color: #cdd6f4;
+      font-family: 'Cascadia Code', 'JetBrains Mono', 'Fira Code', 'Consolas', monospace;
+      overflow: hidden;
+    }
+
+    /* ── Header ── */
+    #header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      height: 40px;
+      padding: 0 16px;
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      flex-shrink: 0;
+      user-select: none;
+    }
+
+    #header .logo {
+      font-size: 15px;
+      font-weight: 700;
+      letter-spacing: 3px;
+      color: var(--green);
+      text-shadow: 0 0 12px var(--green);
+    }
+
+    #header .tagline {
+      font-size: 11px;
+      color: var(--text-dim);
+      letter-spacing: 1px;
+    }
+
+    #header .controls {
+      display: flex;
+      gap: 8px;
+    }
+
+    .btn {
+      padding: 4px 12px;
+      border: 1px solid var(--border);
+      border-radius: 3px;
+      background: transparent;
+      color: var(--text-dim);
+      font-family: inherit;
+      font-size: 11px;
+      cursor: pointer;
+      letter-spacing: 1px;
+      transition: color 0.15s, border-color 0.15s;
+    }
+    .btn:hover { color: var(--cyan); border-color: var(--cyan); }
+    .btn.danger:hover { color: var(--red); border-color: var(--red); }
+
+    /* ── Status bar ── */
+    #statusbar {
+      display: flex;
+      align-items: center;
+      gap: 20px;
+      height: 26px;
+      padding: 0 16px;
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      font-size: 11px;
+      color: var(--text-dim);
+      flex-shrink: 0;
+    }
+
+    #conn-dot {
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      background: var(--text-dim);
+      display: inline-block;
+      transition: background 0.3s;
+    }
+    #conn-dot.connected    { background: var(--green); box-shadow: 0 0 6px var(--green); }
+    #conn-dot.disconnected { background: var(--red); }
+
+    #conn-label { margin-left: 6px; }
+
+    #latency { margin-left: auto; }
+
+    /* ── Terminal wrapper ── */
+    #wrap {
+      display: flex;
+      flex-direction: column;
+      height: 100vh;
+    }
+
+    #terminal-container {
+      flex: 1;
+      overflow: hidden;
+      padding: 6px;
+      background: var(--bg);
+    }
+
+    #terminal {
+      width: 100%;
+      height: 100%;
+    }
+
+    /* ── Game-over overlay ── */
+    #overlay {
+      display: none;
+      position: fixed;
+      inset: 0;
+      background: rgba(0,0,0,0.8);
+      backdrop-filter: blur(4px);
+      align-items: center;
+      justify-content: center;
+      flex-direction: column;
+      gap: 20px;
+      z-index: 100;
+    }
+    #overlay.visible { display: flex; }
+
+    #overlay h2 {
+      font-size: 24px;
+      color: var(--amber);
+      text-shadow: 0 0 16px var(--amber);
+      letter-spacing: 4px;
+    }
+
+    #overlay p { color: var(--text-dim); font-size: 13px; }
+
+    /* ── Help tooltip ── */
+    #help-panel {
+      display: none;
+      position: fixed;
+      top: 76px;
+      right: 16px;
+      width: 300px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 16px;
+      font-size: 12px;
+      color: #8899aa;
+      z-index: 50;
+      line-height: 1.8;
+    }
+    #help-panel.visible { display: block; }
+    #help-panel h3 { color: var(--cyan); margin-bottom: 10px; font-size: 13px; letter-spacing: 1px; }
+    #help-panel kbd {
+      background: #1e1e2e;
+      border: 1px solid #333;
+      border-radius: 3px;
+      padding: 1px 5px;
+      font-size: 11px;
+      color: var(--green);
+    }
+    .help-row { display: flex; justify-content: space-between; gap: 8px; }
+    .help-row span:last-child { color: #556677; text-align: right; }
+  </style>
+</head>
+<body>
+<div id="wrap">
+  <!-- Header -->
+  <div id="header">
+    <div>
+      <span class="logo">ART</span>
+      <span class="tagline"> &nbsp;ASCII Dungeon Escape</span>
+    </div>
+    <div class="controls">
+      <button class="btn" id="btn-help">? Help</button>
+      <button class="btn danger" id="btn-restart">↺ New Game</button>
+    </div>
+  </div>
+
+  <!-- Status bar -->
+  <div id="statusbar">
+    <span id="conn-dot"></span>
+    <span id="conn-label">connecting…</span>
+    <span id="latency"></span>
+  </div>
+
+  <!-- Terminal -->
+  <div id="terminal-container">
+    <div id="terminal"></div>
+  </div>
+</div>
+
+<!-- Game-over overlay -->
+<div id="overlay">
+  <h2>GAME OVER</h2>
+  <p>The session has ended.</p>
+  <button class="btn" id="btn-new-from-overlay">↺ Start New Game</button>
+</div>
+
+<!-- Help panel -->
+<div id="help-panel">
+  <h3>Quick Reference</h3>
+  <div class="help-row"><span><kbd>↑↓←→</kbd> / <kbd>wasd</kbd> / <kbd>hjkl</kbd></span><span>Move</span></div>
+  <div class="help-row"><span><kbd>x</kbd></span><span>Hack nearest terminal</span></div>
+  <div class="help-row"><span><kbd>z</kbd></span><span>Shoot mode (ranged weapon)</span></div>
+  <div class="help-row"><span><kbd>v</kbd></span><span>Toggle sneak</span></div>
+  <div class="help-row"><span><kbd>f</kbd></span><span>Confront / talk</span></div>
+  <div class="help-row"><span><kbd>i</kbd></span><span>Inventory</span></div>
+  <div class="help-row"><span><kbd>g</kbd></span><span>Crafting</span></div>
+  <div class="help-row"><span><kbd>p</kbd></span><span>Shop</span></div>
+  <div class="help-row"><span><kbd>t</kbd></span><span>Toolkit / modules</span></div>
+  <div class="help-row"><span><kbd>u</kbd></span><span>Skills panel</span></div>
+  <div class="help-row"><span><kbd>m</kbd></span><span>Minimap</span></div>
+  <div class="help-row"><span><kbd>Enter</kbd></span><span>Open command prompt</span></div>
+  <div class="help-row"><span><kbd>q</kbd></span><span>Quit game</span></div>
+  <br>
+  <div style="color:#334455;font-size:11px">Commands: hack &lt;mode&gt; · scan · portscan · vulnscan · botnet · equip &lt;name&gt;</div>
+</div>
+
+<script>
+(function () {
+  "use strict";
+
+  // ── Terminal ────────────────────────────────────────────────────────────
+  const term = new Terminal({
+    cursorBlink: true,
+    fontSize: 14,
+    fontFamily: "'Cascadia Code', 'JetBrains Mono', 'Fira Code', 'Consolas', monospace",
+    theme: {
+      background:    "#0a0a0f",
+      foreground:    "#cdd6f4",
+      cursor:        "#00ff88",
+      cursorAccent:  "#0a0a0f",
+      black:         "#1e1e2e",  red:           "#f38ba8",
+      green:         "#a6e3a1",  yellow:        "#f9e2af",
+      blue:          "#89b4fa",  magenta:       "#cba6f7",
+      cyan:          "#89dceb",  white:         "#cdd6f4",
+      brightBlack:   "#45475a",  brightRed:     "#f38ba8",
+      brightGreen:   "#a6e3a1",  brightYellow:  "#f9e2af",
+      brightBlue:    "#89b4fa",  brightMagenta: "#cba6f7",
+      brightCyan:    "#89dceb",  brightWhite:   "#cdd6f4",
+    },
+    allowTransparency: true,
+    scrollback: 1000,
+    convertEol: false,
+  });
+
+  const fitAddon = new FitAddon.FitAddon();
+  term.loadAddon(fitAddon);
+  term.open(document.getElementById("terminal"));
+
+  // ── Status bar helpers ──────────────────────────────────────────────────
+  const dot   = document.getElementById("conn-dot");
+  const label = document.getElementById("conn-label");
+  const latEl = document.getElementById("latency");
+
+  function setStatus(state, text) {
+    dot.className   = state;
+    label.textContent = text;
+  }
+
+  // ── Defer connection until after browser layout is final ────────────────
+  // fitAddon.fit() forces a synchronous reflow, but the container's CSS
+  // flexbox dimensions may not be committed until the next paint frame,
+  // causing getmaxyx() in curses to receive a wrong row count and push the
+  // message log off the bottom.  Waiting one rAF ensures accurate dimensions.
+  requestAnimationFrame(() => {
+    fitAddon.fit();
+
+    const socket = io("/game", {
+      query: { rows: term.rows, cols: term.cols },
+    });
+
+    function sendResize() {
+      socket.emit("resize", { rows: term.rows, cols: term.cols });
+    }
+
+    // ── Socket events ─────────────────────────────────────────────────────
+    socket.on("connect", () => {
+      setStatus("connected", "connected");
+      term.focus();
+      sendResize();
+      // Second resize 300 ms later — catches any remaining layout drift and
+      // ensures SIGWINCH triggers a game redraw with the final row count.
+      setTimeout(sendResize, 300);
+    });
+
+    socket.on("disconnect",    () => setStatus("disconnected", "disconnected"));
+    socket.on("connect_error", () => setStatus("disconnected", "connection error"));
+
+    socket.on("output", (data) => term.write(data.data));
+
+    socket.on("game_over", () => {
+      document.getElementById("overlay").classList.add("visible");
+    });
+
+    // ── Latency ping ──────────────────────────────────────────────────────
+    let pingT = 0;
+    setInterval(() => { pingT = performance.now(); socket.emit("ping_check"); }, 5000);
+    socket.on("pong_check", () => {
+      latEl.textContent = `${Math.round(performance.now() - pingT)} ms`;
+    });
+
+    // ── Restart ───────────────────────────────────────────────────────────
+    async function restartGame() {
+      document.getElementById("overlay").classList.remove("visible");
+      await fetch("/restart", { method: "POST" });
+      term.clear();
+      socket.disconnect();
+      setTimeout(() => {
+        fitAddon.fit();
+        socket.io.opts.query = { rows: term.rows, cols: term.cols };
+        socket.connect();
+      }, 300);
+    }
+
+    document.getElementById("btn-restart").addEventListener("click", restartGame);
+    document.getElementById("btn-new-from-overlay").addEventListener("click", restartGame);
+
+    // ── Input ─────────────────────────────────────────────────────────────
+    term.onData((data) => socket.emit("input", { data }));
+
+    // ── Resize tracking ───────────────────────────────────────────────────
+    new ResizeObserver(() => { fitAddon.fit(); sendResize(); })
+      .observe(document.getElementById("terminal-container"));
+
+    window.addEventListener("resize", () => { fitAddon.fit(); sendResize(); });
+  }); // end requestAnimationFrame
+
+  // ── Help panel (no socket needed) ────────────────────────────────────────
+  const helpPanel = document.getElementById("help-panel");
+  document.getElementById("btn-help").addEventListener("click", () => {
+    helpPanel.classList.toggle("visible");
+  });
+  document.addEventListener("click", (e) => {
+    if (!helpPanel.contains(e.target) && e.target.id !== "btn-help")
+      helpPanel.classList.remove("visible");
+  });
+
+  // ── Block browser shortcuts while game is focused ─────────────────────
+  document.addEventListener("keydown", (e) => {
+    if (document.activeElement === term.textarea) {
+      if ((e.ctrlKey && ["w","r","t","l"].includes(e.key.toLowerCase())) || e.key === "F5")
+        e.preventDefault();
+    }
+  });
+})();
+</script>
+</body>
+</html>
