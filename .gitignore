@@ -13,3 +13,6 @@ parts/
 prime/
 stage/
 *.snap
+
+# ARTHACK meta-progression save
+.arthack_save.json

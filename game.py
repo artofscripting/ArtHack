@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import curses
+import json
+import os
 import random
 import re
 import textwrap
@@ -14,6 +16,36 @@ SIDEBAR = 28
 LOGH = 8
 MIN_W = 64
 MIN_H = 20
+
+# Cross-run save profile (gitignored). Lives beside the source.
+PROFILE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            ".arthack_save.json")
+_PROFILE_DEFAULT = {"unlocked_modules": [], "best_daily": None, "wins": 0}
+_PROFILE_MAX_UNLOCKS = 6
+
+
+def load_profile() -> dict:
+    """Load the persistent meta-progression profile (never raises)."""
+    p = dict(_PROFILE_DEFAULT)
+    try:
+        with open(PROFILE_PATH, encoding="utf-8") as fh:
+            data = json.load(fh)
+        if isinstance(data, dict):
+            p.update({k: data[k] for k in _PROFILE_DEFAULT if k in data})
+    except (OSError, ValueError):
+        pass
+    if not isinstance(p.get("unlocked_modules"), list):
+        p["unlocked_modules"] = []
+    return p
+
+
+def save_profile(profile: dict) -> None:
+    """Persist the profile to disk (best-effort, never raises)."""
+    try:
+        with open(PROFILE_PATH, "w", encoding="utf-8") as fh:
+            json.dump(profile, fh, indent=2)
+    except OSError:
+        pass
 CLUES_FOR_PORTAL = 3
 
 COLOR = {
@@ -82,6 +114,15 @@ MODULE_TO_TOOL = {
     "share_scanner":    "share_harvest",        # T1039   — Data from Network Shared Drive
     "env_harvester":    "env_creds",            # T1552   — Unsecured Credentials
 }
+TOOL_TO_MODULE = {tool: module for module, tool in MODULE_TO_TOOL.items()}
+# These tools can be satisfied by valid credentials instead of requiring a selected module.
+_CRED_SUBSTITUTED_TOOLS = (
+    "credential_dump",
+    "pass_the_hash",
+    "forge_token",
+    "pass_the_ticket",
+    "kerberoast",
+)
 TOOL_DESCRIPTIONS = {
     # base tools
     "wifi_scan":           "scan local CastleNet access points",
@@ -621,6 +662,8 @@ _MODE_HEAT: dict[str, float] = {
     "ntlm":       0.30,
     "lolbin":    -0.30,
 }
+# Turns a module must recharge after being deployed in a hack.
+_MODULE_COOLDOWN = 3
 # Reinforcement guard names by heat level
 _REINFORCE_NAMES = {
     3: ["patrol guard", "sentry"],
@@ -634,7 +677,7 @@ _ARCHETYPES: dict[str, dict] = {
         "label":   "INFILTRATOR",
         "desc":    "Move unseen. Strike first, leave no trace.",
         "skills":  {"evasion": 4, "recon": 2},
-        "modules": ["log_wiper", "process_mask"],
+        "modules": ["port_scanner", "log_wiper", "process_mask"],
         "wallet":  160,
         "passive": "Stealth bonus +2 tiles. Guards lose alert 20% faster.",
     },
@@ -642,7 +685,7 @@ _ARCHETYPES: dict[str, dict] = {
         "label":   "COMBAT SPECIALIST",
         "desc":    "Survive anything. Hit harder.",
         "skills":  {"melee": 6, "ranged": 3},
-        "modules": ["override_bus"],
+        "modules": ["port_scanner", "override_bus"],
         "wallet":  220,
         "passive": "+2 base melee attack. Killing blow drops bonus coin.",
     },
@@ -650,7 +693,7 @@ _ARCHETYPES: dict[str, dict] = {
         "label":   "NETRUNNER",
         "desc":    "Every terminal is a weapon.",
         "skills":  {"recon": 4, "exploit": 2, "creds": 1},
-        "modules": ["sniffer_patch", "cipher_kernel", "port_scanner"],
+        "modules": ["port_scanner", "sniffer_patch", "cipher_kernel"],
         "wallet":  180,
         "passive": "Terminals within 5 tiles reveal type without scanning.",
     },
@@ -658,7 +701,9 @@ _ARCHETYPES: dict[str, dict] = {
 
 
 class Game:
-    def __init__(self, start_bonus: bool = False):
+    def __init__(self, start_bonus: bool = False, daily: bool = False):
+        self.daily = daily
+        self.profile = load_profile()
         self.b = Board()
         self.log: list[tuple[str, str]] = []
         self.started = False
@@ -668,6 +713,7 @@ class Game:
         self.won = False
         self.clues = 0
         self.journal: list[str] = []
+        self.log_scroll = 0
         self.escaped = False
         self.portal_armed = False
         self.portal_placed = False
@@ -698,6 +744,14 @@ class Game:
         self.craft_gem_item: tuple | None = None
         self.craft_gem_cursor = 0
         self.craft_gem_choice = None
+        # Interactive hack overlay — player picks which modules to deploy.
+        self.hack_pos: tuple[int, int] | None = None
+        self.hack_term: dict | None = None
+        self.hack_cursor = 0
+        self.hack_scroll = 0
+        self.hack_selected: set[str] = set()
+        # Last failed hack — press ! to retry it with the same module loadout.
+        self.last_failed_hack: dict | None = None
         self.shoot_mode = False
         # melee/ranged: XP counters (3 XP = 1 level)
         # hacking sub-skills: direct levels (1 successful use = 1 level)
@@ -721,6 +775,23 @@ class Game:
         # Keys: "gpu", "cloud", "relay", "compute" — values: set of provider ssids.
         self.resources: dict[str, set[str]] = {"gpu": set(), "cloud": set(),
                                                 "relay": set(), "compute": set()}
+        # Blue-team incident response: id of the active SOC responder entity (or None).
+        self.responder_id: str | None = None
+        self._responder_warned: int = 0   # escalation stage for "tells" before IR closes in
+        # Pivot hack: True while the current hack is routed through a C2 node.
+        self.pivot_hack: bool = False
+        # Per-module cooldowns (turns) after deployment; chosen exploit mode.
+        self.module_cd: dict[str, int] = {}
+        self.hack_mode: str = "balanced"
+        # Per-run statistics (shown on the run-summary screen).
+        self.stats: dict[str, int] = {
+            "terminals_rooted": 0, "modules_crafted": 0, "honeypots_tripped": 0,
+            "contracts_done": 0, "pivots": 0, "logs_cleared": 0,
+        }
+        self._heat_peak: float = 0.0
+        # Side-contracts (objectives) and street reputation.
+        self.contracts: list[dict] = []
+        self.rep: int = 0
         self.equipped: dict[str, object] = {
             "weapon": None,
             "armor_head": None,
@@ -748,7 +819,9 @@ class Game:
         self._init_colors()
         self._archetype_select(scr)
         self._apply_archetype()
+        self._apply_profile_unlocks()
         self.b.generate_dungeon()
+        self._generate_contracts()
         if self.start_bonus:
             self._apply_start_bonus()
         self.b.compute_visible(radius=self._vision_radius())
@@ -781,6 +854,10 @@ class Game:
             return self._handle_shop_overlay_key(ch)
         if self.overlay == "craft":
             return self._handle_craft_overlay_key(ch)
+        if self.overlay == "hack":
+            return self._handle_hack_overlay_key(ch)
+        if self.overlay == "log":
+            return self._handle_log_overlay_key(ch)
         self.overlay = None   # non-interactive overlays dismiss on any key
         return True
 
@@ -849,6 +926,10 @@ class Game:
                 setattr(it, k, v)
             return it
 
+        starter_modules = ["port_scanner"] + [
+            mod for mod in MODULE_TO_TOOL.keys() if mod != "port_scanner"
+        ]
+
         # Level 3 backpack
         self.b.inventory.append(_it(
             "[", "leather haversack", "a well-stitched leather haversack", "backpack",
@@ -898,7 +979,9 @@ class Game:
         for mod in list(MODULE_TO_TOOL.keys())[:10]:
             self._unlock_module(mod, "start bonus")
 
-        self._sys("Start bonus: haversack, war axe, 14 gems, 10 modules — XP ×3.")
+        self.wallet_cp = 1000
+
+        self._sys("Start bonus: 10 platinum, haversack, war axe, 14 gems, 10 modules — XP ×3.")
 
     def _apply_archetype(self) -> None:
         """Apply starting bonuses for the chosen archetype."""
@@ -911,6 +994,46 @@ class Game:
             if tool:
                 self.tools.add(tool)
         self.wallet_cp = arch["wallet"]
+
+    def _apply_profile_unlocks(self):
+        """Seed carried-over modules from previous wins (meta-progression)."""
+        carried = [m for m in self.profile.get("unlocked_modules", [])
+                   if m in MODULE_TO_TOOL]
+        for mod in carried:
+            self.modules.add(mod)
+            tool = MODULE_TO_TOOL.get(mod)
+            if tool:
+                self.tools.add(tool)
+        if carried:
+            self._sys(f"[PROFILE] Carried over {len(carried)} module(s) from past runs: "
+                      + ", ".join(carried))
+
+    def _daily_score(self) -> int:
+        """Higher is better: rooting and contracts pay; turns and heat cost."""
+        return (self.stats["terminals_rooted"] * 100
+                + self.stats["contracts_done"] * 250
+                + self.clues * 50
+                - self.turn_count
+                - int(self._heat_peak * 40))
+
+    def _save_run_results(self):
+        """Update and persist the meta-profile after a win."""
+        prof = self.profile
+        prof["wins"] = int(prof.get("wins", 0)) + 1
+        # Carry over one not-yet-saved module the player ended the run with.
+        pool = [m for m in sorted(self.modules)
+                if m in MODULE_TO_TOOL and m not in prof.get("unlocked_modules", [])]
+        if pool:
+            unlocks = list(prof.get("unlocked_modules", []))
+            unlocks.append(random.choice(pool))
+            prof["unlocked_modules"] = unlocks[-_PROFILE_MAX_UNLOCKS:]
+        if self.daily:
+            score = self._daily_score()
+            best = prof.get("best_daily")
+            if best is None or score > best:
+                prof["best_daily"] = score
+                self._new_daily_best = True
+        save_profile(prof)
 
     def _init_colors(self):
         self.has_color = curses.has_colors()
@@ -935,10 +1058,21 @@ class Game:
                 pass
 
     def _attr(self, pair, bold=False):
-        if not self.has_color:
+        if not getattr(self, "has_color", False):
             return curses.A_BOLD if bold else 0
         a = curses.color_pair(pair)
         return a | curses.A_BOLD if bold else a
+
+    def _rarity_attr(self, rarity: str, bold: bool = False):
+        rarity = str(rarity or "common").lower()
+        pair = {
+            "common": 1,
+            "uncommon": 8,
+            "rare": 5,
+            "epic": 7,
+            "legendary": 4,
+        }.get(rarity, 1)
+        return self._attr(pair, bold=bold)
 
     # ===================================================================
     #  input
@@ -977,6 +1111,12 @@ class Game:
         if ch in (ord("n"), ord("N")):
             self.overlay = "journal"
             return True
+        if ch in (ord("o"), ord("O")):
+            self._open_log_panel()
+            return True
+        if ch == ord("="):
+            self.overlay = "summary"
+            return True
         if ch in (ord("g"), ord("G")):
             self._open_craft()
             return True
@@ -994,6 +1134,9 @@ class Game:
                            {"target": "search the area for anything hidden",
                             "search": True})
             self._advance_turn()
+            return True
+        if ch in (ord("A"),):
+            self._auto_loot_room()
             return True
         if ch in (ord("r"), ord("R")):
             self._offline("examine",
@@ -1024,6 +1167,12 @@ class Game:
             return True
         if ch in (ord("x"), ord("X")):
             self._hack_terminal_action()
+            return True
+        if ch == ord("!"):
+            self._retry_failed_hack()
+            return True
+        if ch == ord("-"):
+            self._clear_logs_action()
             return True
         move = self._key_to_dir(ch)
         if move:
@@ -1063,6 +1212,10 @@ class Game:
             return False
 
         self.b.entities.pop(ent.id, None)
+        if ent.id == self.responder_id:
+            self.responder_id = None
+            self._responder_warned = 0
+        self._adjust_rep(-1, "left a body")
         self._gm(f"You defeat {ent.name} and strip useful hardware from the remains.")
         module = self._module_for_entity(ent.name)
         if module:
@@ -1123,6 +1276,10 @@ class Game:
         else:
             self._sys(f"Looted module from {source_name}: {module}.")
 
+    @staticmethod
+    def _module_sort_key(module: str) -> tuple[int, str]:
+        return (0, module) if module == "port_scanner" else (1, module)
+
     def _handle_local_command(self, text: str) -> bool:
         low = text.lower().strip()
         if not low:
@@ -1149,6 +1306,18 @@ class Game:
         if low.startswith("sell "):
             self._sell_shop_item(text[5:].strip())
             return True
+        if low.startswith("drop "):
+            self._drop_item_by_name(text[5:].strip())
+            return True
+        if low.startswith("move "):
+            rest = text[5:].strip()
+            move_to = None
+            m = re.search(r"\s+to\s+(backpack|inventory|bag)\s*$", rest, re.I)
+            if m:
+                move_to = "backpack" if m.group(1).lower() == "backpack" else "bag"
+                rest = rest[:m.start()].strip()
+            self._move_item_by_name(rest, move_to)
+            return True
 
         if low in ("help hack", "hack help", "i am confused", "confused"):
             self._emit_hacking_instructions()
@@ -1165,6 +1334,15 @@ class Game:
             return True
         if low.startswith("botnet") or low in ("bot", "implant", "install botnet"):
             self._install_botnet()
+            return True
+        if low in ("clearlogs", "clear logs", "wipe logs", "wipe", "cover tracks"):
+            self._clear_logs_action()
+            return True
+        if low in ("pivot", "tunnel", "pivot hack", "lateral"):
+            self._pivot_hack_action()
+            return True
+        if low in ("contracts", "contract", "jobs", "objectives"):
+            self.overlay = "journal"
             return True
         if low.startswith("vulnscan") or low in ("vs", "vuln"):
             self._vuln_scan_terminal()
@@ -1367,7 +1545,42 @@ class Game:
             self._sys(f"  {ssid} ({control}) does not provide a resource type.")
         self.skills["persist"] = self.skills.get("persist", 0) + 1
         self._sys(f"  +1 persist XP (now Lv{self.skills['persist']}).")
+        self._contract_progress("botnet")
         self._advance_turn()
+
+    _PIVOT_RANGE = 8
+
+    def _pivot_hack_action(self):
+        """T1572 — tunnel a hack through a nearby C2 node to a distant terminal."""
+        if "pivot_relay" not in self.tools:
+            self._sys("pivot: need the pivot_relay tool (craft ssh_tunneler module at g).")
+            return
+        hit = self._nearest_terminal(max_dist=2)
+        if not hit or not hit[1].get("botnet"):
+            self._sys("pivot: stand beside a rooted terminal running a C2 node "
+                      "(install one with 'botnet' first).")
+            return
+        (sx, sy), src = hit
+        # Find the nearest un-rooted terminal within pivot range of the C2 node.
+        best, best_d = None, self._PIVOT_RANGE + 1
+        for (x, y), spec in self.b.specials.items():
+            if spec.get("kind") != "terminal" or (x, y) == (sx, sy):
+                continue
+            if spec.get("hacked"):
+                continue
+            d = abs(x - sx) + abs(y - sy)
+            if d < best_d:
+                best_d, best = d, ((x, y), spec)
+        if not best:
+            self._sys(f"pivot: no un-rooted terminal within {self._PIVOT_RANGE} tiles of "
+                      f"{src.get('ssid', 'the C2 node')}.")
+            return
+        (tx, ty), tgt = best
+        self.pivot_hack = True
+        self.stats["pivots"] += 1
+        self._sys(f"pivot: tunneling through {src.get('ssid')} → {tgt.get('ssid')} "
+                  f"({best_d} tiles away). Remote hacks are harder (-12% success).")
+        self._open_hack_overlay((tx, ty), tgt)
 
     def _port_scan_terminal(self):
         """portscan — reveal open services on the nearest terminal."""
@@ -1402,8 +1615,12 @@ class Game:
             self._sys(f"vulnscan: {ssid} not yet port-scanned — run 'portscan' first.")
             return
         self._ensure_skill_reqs(term)
+        term["vulnscanned"] = True
         reqs = term["skill_reqs"]
         self._sys(f"vulnscan {ssid} — vulnerability assessment:")
+        if term.get("honeypot"):
+            self._sys("  ⚠ DECEPTION DETECTED: canary tokens + fake services. "
+                      "This is a HONEYPOT — hacking it will burn you. Avoid.")
         tools_needed: set[str] = set()
         resources_needed: set[str] = set()
         for proto, port in term["services"]:
@@ -1449,6 +1666,14 @@ class Game:
                 self._sys(f"    ✗ {t}{hint}")
         else:
             self._sys("  All required tools present. Ready to hack.")
+        # Module deployment plan — exactly which modules to load in the hack menu.
+        req_mods = self._required_modules_for_terminal(term)
+        if req_mods:
+            self._sys("  Modules that WILL work on this target (deploy these):")
+            for m in req_mods:
+                have = "✓" if m in self.modules else "✗ craft it"
+                self._sys(f"    {have:<10} {m:<18} → {MODULE_TO_TOOL.get(m, '')}")
+            self._sys("  Press x to open the hack menu; any other module raises threat.")
         self._advance_turn()
 
     def _step_difficulty(self, delta: int):
@@ -1566,7 +1791,85 @@ class Game:
             self._restock_shops()
             self.next_restock_turn = self.turn_count + random.randint(*SHOP_RESTOCK_INTERVAL)
 
+        if self.module_cd:
+            self.module_cd = {m: t - 1 for m, t in self.module_cd.items() if t - 1 > 0}
+
+        self._botnet_tick()
         self._update_enemies()
+
+    # ── Side contracts ───────────────────────────────────────────────────────
+    def _generate_contracts(self):
+        """Roll three side-contracts for the run (idempotent)."""
+        if self.contracts:
+            return
+        root_n = random.randint(2, 3)
+        craft_n = random.randint(2, 3)
+        node_n = random.randint(1, 2)
+        self.contracts = [
+            {"kind": "root", "target": root_n, "progress": 0, "done": False,
+             "reward_cp": 180 * root_n, "reward_mod": None,
+             "desc": f"Root {root_n} terminals"},
+            {"kind": "craft", "target": craft_n, "progress": 0, "done": False,
+             "reward_cp": 120 * craft_n, "reward_mod": None,
+             "desc": f"Craft {craft_n} hack modules"},
+            {"kind": "botnet", "target": node_n, "progress": 0, "done": False,
+             "reward_cp": 250 * node_n, "reward_mod": "ssh_tunneler",
+             "desc": f"Install {node_n} C2 botnet node(s)"},
+        ]
+
+    def _contract_progress(self, kind: str, amount: int = 1):
+        for c in self.contracts:
+            if c["kind"] != kind or c["done"]:
+                continue
+            c["progress"] = min(c["target"], c["progress"] + amount)
+            if c["progress"] >= c["target"]:
+                self._complete_contract(c)
+
+    def _complete_contract(self, c: dict):
+        c["done"] = True
+        self.stats["contracts_done"] += 1
+        self.wallet_cp += c["reward_cp"]
+        self._adjust_rep(+2, "contract fulfilled")
+        msg = f"[CONTRACT] '{c['desc']}' complete! +{self._coins_text(c['reward_cp'])}"
+        if c.get("reward_mod") and c["reward_mod"] not in self.modules:
+            self._unlock_module(c["reward_mod"], "contract reward")
+        self._sys(msg)
+
+    # ── Street reputation ────────────────────────────────────────────────────
+    def _adjust_rep(self, delta: int, reason: str = ""):
+        if delta == 0:
+            return
+        self.rep = max(-10, min(10, self.rep + delta))
+        tag = "+" if delta > 0 else ""
+        note = f" ({reason})" if reason else ""
+        self._sys(f"[REP {tag}{delta}] street cred now {self.rep}{note}.")
+
+    def _rep_sight_mod(self) -> int:
+        """High rep makes guards overlook you; low rep makes them jumpy."""
+        if self.rep >= 6:
+            return -2
+        if self.rep >= 3:
+            return -1
+        if self.rep <= -6:
+            return 2
+        if self.rep <= -3:
+            return 1
+        return 0
+
+    def _botnet_tick(self):
+        """Installed C2 nodes passively mine coin and slowly bleed off heat."""
+        if self.turn_count % 10 != 0:
+            return
+        nodes = sum(len(s) for s in self.resources.values())
+        if nodes <= 0:
+            return
+        coin = nodes * random.randint(6, 14)
+        self.wallet_cp += coin
+        # Each node quietly launders a little of your footprint.
+        if self.heat > 0:
+            self._lower_heat(min(0.3, 0.05 * nodes))
+        self._sys(f"[BOTNET] {nodes} C2 node(s) mined {self._coins_text(coin)} "
+                  f"and scrubbed background noise.")
 
     def _update_enemies(self):
         b = self.b
@@ -1574,18 +1877,28 @@ class Game:
         visible = b.visible
         heat_lv = self._heat_level()
         stealth_cut = self._stealth_bonus() if self.stealth_mode else 0
+        env_sight = self._env_enemy_sight()              # ≤0 from blinded cameras
+        env_sight += self._rep_sight_mod()               # reputation tints perception
+        patrol_frozen = self._env_flag("patrol_freeze")  # power grid destabilized
+        spot_heat_off = self._env_flag("suppress_spot_heat")  # alarms spoofed
 
         for ent in list(b.entities.values()):
             if not ent.hostile:
                 continue
+            # The SOC responder is driven by _update_responder (hunts terminals,
+            # not the player), so skip it in the normal guard AI.
+            if ent.id == self.responder_id:
+                continue
 
             dist = abs(ent.x - px) + abs(ent.y - py)
-            eff_sight = max(1, ent.sight_radius + _HEAT_SIGHT_BONUS[heat_lv] - stealth_cut)
+            eff_sight = max(1, ent.sight_radius + _HEAT_SIGHT_BONUS[heat_lv]
+                            - stealth_cut + env_sight)
 
             if (ent.x, ent.y) in visible and dist <= eff_sight:
                 if not ent.alerted:
                     ent.alerted = True
-                    self._raise_heat(1.0)
+                    if not spot_heat_off:
+                        self._raise_heat(1.0)
                     if self.stealth_mode:
                         self.stealth_mode = False
                         self._sys(f"The {ent.name} spots you! Stealth broken.")
@@ -1593,7 +1906,8 @@ class Game:
                         self._sys(f"The {ent.name} spots you!")
 
             if not ent.alerted:
-                self._patrol_move(ent)
+                if not patrol_frozen:
+                    self._patrol_move(ent)
                 continue
 
             # Infiltrator passive: alerted guards that can't see you have a
@@ -1617,6 +1931,9 @@ class Game:
         if heat_lv >= 3 and (self.turn_count - self._last_heat_spawn) >= intvl:
             self._spawn_reinforcement()
             self._last_heat_spawn = self.turn_count
+
+        # Blue-team incident response (hunts your rooted terminals).
+        self._update_responder()
 
     def _patrol_move(self, ent):
         """Move a non-alerted guard slowly along a patrol route."""
@@ -1667,6 +1984,101 @@ class Game:
         b.entities[eid] = ent
         self._sys(f"[HEAT {heat_lv}] {name.title()} dispatched to your position!")
 
+    # ── Blue-team incident response ──────────────────────────────────────────
+    def _hacked_terminals(self) -> list:
+        """(pos, spec) for every currently-rooted terminal."""
+        return [(pos, spec) for pos, spec in self.b.specials.items()
+                if spec.get("kind") == "terminal" and spec.get("hacked")]
+
+    def _active_responder(self):
+        return self.b.entities.get(self.responder_id) if self.responder_id else None
+
+    def _spawn_responder(self):
+        """Spawn a SOC incident-response unit (B) that hunts rooted terminals."""
+        b = self.b
+        px, py = b.px, b.py
+        candidates = []
+        for dy in range(-22, 23):
+            for dx in range(-22, 23):
+                x, y = px + dx, py + dy
+                dist = abs(dx) + abs(dy)
+                if 12 <= dist <= 22 and b.get(x, y) == "." and not b.entity_at(x, y):
+                    candidates.append((x, y))
+        if not candidates:
+            return
+        x, y = random.choice(candidates)
+        from board import Entity
+        eid = b._id("soc")
+        ent = Entity(id=eid, x=x, y=y, name="CastleNet-IR responder", char="B",
+                     hostile=True, sight_radius=7, alerted=True)
+        ent.hp = 34; ent.max_hp = 34
+        b.entities[eid] = ent
+        self.responder_id = eid
+        self._responder_warned = 1
+        self._sys("[SOC] Anomalous traffic flagged — CastleNet incident response is mobilizing.")
+        self._term_log("ALERT: SIEM correlation rule fired — dispatching IR to rooted assets.")
+
+    def _despawn_responder(self, reason: str = ""):
+        ent = self._active_responder()
+        if ent:
+            self.b.entities.pop(ent.id, None)
+        self.responder_id = None
+        self._responder_warned = 0
+        if reason:
+            self._sys(f"[SOC] {reason}")
+
+    def _resecure_terminal(self, pos, spec):
+        """IR re-secures a rooted terminal: revoke root, kill its botnet/resource."""
+        ssid = spec.get("ssid", "CastleNet")
+        spec["hacked"] = False
+        spec["vulnscanned"] = False
+        if spec.get("botnet"):
+            spec["botnet"] = False
+        res = _TERMINAL_RESOURCE.get(spec.get("control", "doors"))
+        if res and res in self.resources:
+            self.resources[res].discard(ssid)
+        self._gm(f"[SOC] Incident response re-secured {ssid}. Root revoked — you must re-hack it.")
+        self._term_log(f"REMEDIATION: credentials rotated on {ssid}; session terminated.")
+
+    def _update_responder(self):
+        """Spawn, drive, and retire the blue-team responder based on heat & targets."""
+        heat_lv = self._heat_level()
+        targets = self._hacked_terminals()
+        ent = self._active_responder()
+
+        # Retire conditions.
+        if ent and (heat_lv < 2 or not targets):
+            self._despawn_responder("Heat subsiding — IR stands down and returns to the SOC.")
+            return
+
+        # Spawn when things get hot and you have assets worth defending.
+        if not ent:
+            if heat_lv >= 3 and targets:
+                self._spawn_responder()
+            return
+
+        # Hunt the nearest rooted terminal.
+        tx, ty = min((p for p, _ in targets),
+                     key=lambda p: abs(p[0] - ent.x) + abs(p[1] - ent.y))
+        dist = abs(tx - ent.x) + abs(ty - ent.y)
+
+        # Tells as it closes in.
+        if dist <= 6 and self._responder_warned < 2:
+            self._responder_warned = 2
+            self._sys("[SOC] Footsteps echo in the server aisle — IR is closing on a rooted terminal.")
+        elif dist <= 12 and self._responder_warned < 2:
+            self._sys("[SOC] IR is sweeping the wing for your implants.")
+
+        if dist <= 1:
+            spec = self.b.specials.get((tx, ty))
+            if spec and spec.get("hacked"):
+                self._resecure_terminal((tx, ty), spec)
+            return
+        # Move two steps per turn — IR is faster than a patrol.
+        self._enemy_move_toward(ent, tx, ty)
+        if abs(tx - ent.x) + abs(ty - ent.y) > 1:
+            self._enemy_move_toward(ent, tx, ty)
+
     def _enemy_attack(self, ent):
         _, enemy_atk, _ = self._enemy_profile(ent)
         _, p_def = self._combat_power()
@@ -1678,7 +2090,6 @@ class Game:
         )
         if self.hp <= 0:
             loss = max(25, self.wallet_cp // 5)
-            self.wallet_cp = max(0, self.wallet_cp - loss)
             self.hp = max(10, self.max_hp // 3)
             self._gm(
                 f"{ent.name} beats you down. You crawl away, losing "
@@ -1728,6 +2139,7 @@ class Game:
             return
         old_lv = self._heat_level()
         self.heat = min(5.0, self.heat + amount)
+        self._heat_peak = max(self._heat_peak, self.heat)
         new_lv = self._heat_level()
         if new_lv > old_lv:
             self._sys(_HEAT_ESCALATION_MSG[new_lv])
@@ -1740,6 +2152,25 @@ class Game:
         new_lv = self._heat_level()
         if new_lv < old_lv:
             self._sys(f"[HEAT {new_lv}: {_HEAT_LABELS[new_lv]}] Situation cooling.")
+
+    # ── Environmental effects from hacked control systems ─────────────────────
+    def _add_env_effect(self, name: str, duration: int, **flags):
+        """Add (or refresh) a timed world effect that alters enemy behavior.
+        Stored in active_effects so it auto-expires and shows in the effects panel."""
+        for fx in self.active_effects:
+            if fx.get("name") == name:
+                fx["duration"] = max(fx.get("duration", 0), duration)
+                fx.update(flags)
+                return
+        fx = {"name": name, "duration": duration, "env": True}
+        fx.update(flags)
+        self.active_effects.append(fx)
+
+    def _env_flag(self, flag: str) -> bool:
+        return any(fx.get(flag) for fx in self.active_effects)
+
+    def _env_enemy_sight(self) -> int:
+        return sum(int(fx.get("enemy_sight", 0)) for fx in self.active_effects)
 
     # ── Stealth helpers ──────────────────────────────────────────────────────
 
@@ -1817,6 +2248,11 @@ class Game:
 
     def _kill_entity(self, ent, cause: str = "shot"):
         self.b.entities.pop(ent.id, None)
+        if ent.id == self.responder_id:
+            self.responder_id = None
+            self._responder_warned = 0
+            self._sys("[SOC] IR unit down — but another will deploy if heat stays high.")
+        self._adjust_rep(-1, "left a body")
         self._gm(f"You {cause} {ent.name}!")
         module = self._module_for_entity(ent.name)
         if module:
@@ -1994,6 +2430,199 @@ class Game:
                 return it
         return None
 
+    def _inventory_source(self, it) -> str | None:
+        if it in self.b.inventory:
+            return "bag"
+        if it in self.backpack_inv:
+            return "backpack"
+        return None
+
+    def _sync_inventory_cursor(self) -> None:
+        entries = self._inventory_entries()
+        self.inv_cursor = 0 if not entries else max(0, min(self.inv_cursor, len(entries) - 1))
+
+    def _drop_item_to_floor(self, it, origin: str) -> bool:
+        if origin not in ("bag", "backpack"):
+            self._sys("Unequip or stash that item before dropping it.")
+            return False
+        if origin == "bag":
+            self.b.inventory.remove(it)
+        else:
+            self.backpack_inv.remove(it)
+        self.b.add_item(
+            self.b.px, self.b.py,
+            getattr(it, "char", "$") or "*",
+            getattr(it, "name", "item"),
+            getattr(it, "desc", ""),
+            getattr(it, "kind", "item"),
+            slot=getattr(it, "slot", "none"),
+            attack=getattr(it, "attack", 0),
+            defense=getattr(it, "defense", 0),
+            quality=getattr(it, "quality", "common"),
+            rarity=getattr(it, "rarity", "common"),
+            enchantment=getattr(it, "enchantment", ""),
+            sight_bonus=getattr(it, "sight_bonus", 0),
+            weight=getattr(it, "weight", 1.0),
+            value_cp=getattr(it, "value_cp", 0),
+            material=getattr(it, "material", ""),
+            range=getattr(it, "range", 0),
+            carry_bonus=getattr(it, "carry_bonus", 0.0),
+            bag_capacity=getattr(it, "bag_capacity", 0),
+            bag_slots=getattr(it, "bag_slots", 0),
+            hack_bonus=getattr(it, "hack_bonus", 0),
+        )
+        self._sys(f"Dropped {it.name} at your feet.")
+        self._sync_inventory_cursor()
+        self._advance_turn()
+        return True
+
+    def _collect_world_item(self, it) -> bool:
+        if it is None:
+            return False
+        b = self.b
+        if it.kind == "currency":
+            b.remove_id(it.id)
+            self.wallet_cp += int(getattr(it, "value_cp", 0) or 0)
+            self._sys(f"You collect coin: {self._coins_text(it.value_cp)}.")
+            return True
+
+        next_weight = self._carry_weight() + self._item_weight(it)
+        if next_weight > self._effective_max_weight():
+            self._sys("Too heavy to pick up — over total carry limit.")
+            return False
+
+        if len(b.inventory) < BASE_INV_SLOTS:
+            b.remove_id(it.id)
+            b.inventory.append(it)
+            self._sys(f"You pick up the {it.name}.")
+        elif self._backpack_capacity() > len(self.backpack_inv):
+            b.remove_id(it.id)
+            self.backpack_inv.append(it)
+            cap = self._backpack_capacity()
+            self._sys(
+                f"Bag full — {it.name} → backpack "
+                f"({len(self.backpack_inv)}/{cap} slots)."
+            )
+        else:
+            hint = " Equip a backpack to carry more." if not self.equipped.get("back") else ""
+            self._sys(f"Inventory full ({BASE_INV_SLOTS} items + backpack).{hint}")
+            return False
+
+        if it.kind == "clue":
+            self.clues += 1
+            self.journal.append(it.desc or it.name)
+            self._maybe_arm_portal()
+        elif it.kind == "module":
+            mod = ""
+            low = it.name.lower()
+            for key in MODULE_TO_TOOL:
+                if key in low:
+                    mod = key
+                    break
+            if mod:
+                self._unlock_module(mod, "found loot")
+        return True
+
+    def _loot_room_floor_items(self, room) -> bool:
+        moved = False
+        if room is None:
+            return moved
+        blocked_tiles = {"<", "V", "T", "O"}
+        room_items = [
+            it for it in list(self.b.items.values())
+            if room.contains(it.x, it.y)
+            and self.b.get(it.x, it.y) not in blocked_tiles
+            and self.b.specials.get((it.x, it.y), {}).get("kind") not in ("loot_chest", "hack_chest")
+        ]
+        for it in room_items:
+            moved = self._collect_world_item(it) or moved
+        return moved
+
+    def _auto_loot_room(self):
+        room = self.b.room_at(self.b.px, self.b.py)
+        if room is None:
+            self._sys("There is no room here to loot.")
+            self._advance_turn()
+            return
+
+        moved_any = self._loot_room_floor_items(room)
+
+        chest_positions = [
+            pos for pos, spec in self.b.specials.items()
+            if spec.get("kind") == "loot_chest"
+            and room.contains(*pos)
+            and not spec.get("locked", False)
+        ]
+        for pos in sorted(chest_positions):
+            self._open_loot_chest(pos)
+            if self._loot_room_floor_items(room):
+                moved_any = True
+
+        if moved_any:
+            self._sys("You sweep the room for loot.")
+        else:
+            self._sys("No loose loot found here.")
+        self._advance_turn()
+
+    def _move_item_between_containers(self, it, origin: str) -> bool:
+        if origin == "bag":
+            if not self.equipped.get("back"):
+                self._sys("Equip a backpack first, or drop the item instead.")
+                return False
+            if len(self.backpack_inv) >= self._backpack_capacity():
+                self._sys("Your backpack is full.")
+                return False
+            self.b.inventory.remove(it)
+            self.backpack_inv.append(it)
+            self._sys(f"Moved {it.name} into the backpack.")
+        elif origin == "backpack":
+            if len(self.b.inventory) >= BASE_INV_SLOTS:
+                self._sys("Main inventory is full.")
+                return False
+            self.backpack_inv.remove(it)
+            self.b.inventory.append(it)
+            self._sys(f"Moved {it.name} into main inventory.")
+        else:
+            self._sys("That item cannot be moved right now.")
+            return False
+        self._sync_inventory_cursor()
+        self._advance_turn()
+        return True
+
+    def _move_item_by_name(self, needle: str, target: str | None = None) -> None:
+        if not needle:
+            self._sys("Usage: move <item name> [to backpack|to inventory]")
+            return
+        it = self._find_inventory_item(needle)
+        if it is None:
+            self._sys("That item is not in your inventory.")
+            return
+        origin = self._inventory_source(it)
+        if origin == "bag":
+            if target in (None, "backpack"):
+                self._move_item_between_containers(it, origin)
+                return
+            self._sys("That item is already in main inventory.")
+            return
+        if origin == "backpack":
+            if target in (None, "inventory", "bag"):
+                self._move_item_between_containers(it, origin)
+                return
+            self._sys("That item is already in the backpack.")
+            return
+        self._sys("Use move <item> to backpack or move <item> to inventory.")
+
+    def _drop_item_by_name(self, needle: str) -> None:
+        if not needle:
+            self._sys("Usage: drop <item name>")
+            return
+        it = self._find_inventory_item(needle)
+        if it is None:
+            self._sys("That item is not in your inventory.")
+            return
+        origin = self._inventory_source(it)
+        self._drop_item_to_floor(it, origin or "")
+
     _INV_KIND_ORDER = ("weapon", "armor", "backpack", "potion", "module", "material")
     _SHOP_KIND_ORDER = ("weapon", "armor", "backpack", "jewelry", "potion", "module", "material", "item")
     _SHOP_KIND_LABELS = {
@@ -2084,6 +2713,8 @@ class Game:
         if ch in (ord("e"), ord("E")):
             if origin == "bag":
                 self._equip_item(item)
+            elif origin == "backpack":
+                self._equip_item_from_backpack(item)
             else:
                 self._unequip_slot(entry["slot"])
             self._advance_turn()
@@ -2093,6 +2724,12 @@ class Game:
                 self._use_item(item)
             else:
                 self._sys("Unequip this item before using it.")
+            return True
+        if ch in (ord("m"), ord("M")):
+            self._move_item_between_containers(item, origin)
+            return True
+        if ch in (ord("d"), ord("D")):
+            self._drop_item_to_floor(item, origin)
             return True
         return True
 
@@ -2104,7 +2741,57 @@ class Game:
         if it is None:
             self._sys("That item is not in your inventory.")
             return
-        self._equip_item(it)
+        source = self._inventory_source(it)
+        if source == "backpack":
+            self._equip_item_from_backpack(it)
+        else:
+            self._equip_item(it)
+
+    def _equip_item_from_backpack(self, it):
+        slot = getattr(it, "slot", "none")
+        if slot == "ring":
+            target = next((s for s in RING_SLOTS if self.equipped.get(s) is None), None)
+            if target is None:
+                self._sys("All ring slots are occupied. Unequip a ring slot first.")
+                return
+            self.backpack_inv.remove(it)
+            self.equipped[target] = it
+            self._sys(f"Equipped {it.name} in {target}.")
+            self.b.compute_visible(radius=self._vision_radius())
+            return
+        if slot == "back":
+            new_cap = int(getattr(it, "bag_capacity", 0) or 0)
+            if len(self.backpack_inv) - 1 > new_cap:
+                self._sys(
+                    f"Cannot equip {it.name}: it holds {new_cap} items but your "
+                    f"backpack has {len(self.backpack_inv) - 1}. Empty it first."
+                )
+                return
+            old_bp = self.equipped.get("back")
+            self.backpack_inv.remove(it)
+            if old_bp is not None:
+                self.backpack_inv.append(old_bp)
+            self.equipped["back"] = it
+            carry = float(getattr(it, "carry_bonus", 0.0) or 0.0)
+            self._sys(
+                f"Equipped {it.name} (back) — {new_cap} slots, +{carry:.0f} carry. "
+                f"Contents transferred ({len(self.backpack_inv)} items)."
+            )
+            self.b.compute_visible(radius=self._vision_radius())
+            return
+        if slot not in self.equipped:
+            self._sys("That item cannot be equipped.")
+            return
+        current = self.equipped.get(slot)
+        if current is it:
+            self._sys(f"{it.name} is already equipped.")
+            return
+        self.backpack_inv.remove(it)
+        if current is not None:
+            self.backpack_inv.append(current)
+        self.equipped[slot] = it
+        self._sys(f"Equipped {it.name} in {slot}.")
+        self.b.compute_visible(radius=self._vision_radius())
 
     def _equip_item(self, it):
         slot = getattr(it, "slot", "none")
@@ -2394,9 +3081,15 @@ class Game:
         if it is None:
             self._sys("That item is not in your inventory.")
             return
-        if it.kind in ("clue", "key"):
+        if it.kind == "clue":
             self._sys("The quartermaster refuses to buy mission-critical items.")
             return
+        if it.kind == "key":
+            key_count = sum(1 for inv_it in self.b.inventory if inv_it.kind == "key")
+            key_count += sum(1 for inv_it in self.backpack_inv if inv_it.kind == "key")
+            if key_count <= 1:
+                self._sys("The quartermaster refuses to buy your last key.")
+                return
 
         value = int(getattr(it, "value_cp", 80) or 80)
         payout = max(1, int(value * 0.6))
@@ -2640,7 +3333,11 @@ class Game:
             low = it.name.lower()
             mod_key = next((k for k in MODULE_TO_TOOL if k in low), None)
             if mod_key:
+                newly = mod_key not in self.modules
                 self._unlock_module(mod_key, f"crafted {it.name}")
+                if newly:
+                    self.stats["modules_crafted"] += 1
+                    self._contract_progress("craft")
                 self._advance_turn()
                 return
         self.b.inventory.append(it)
@@ -2953,6 +3650,28 @@ class Game:
                 return (x, y), spec
         return None, None
 
+    def _clear_logs_action(self):
+        """T1070 — wipe a rooted terminal's logs to drop heat and shake off IR."""
+        if "log_wiper" not in self.modules and "erase_logs" not in self.tools:
+            self._sys("clearlogs: need the log_wiper module (T1070 erase_logs). Craft it at g.")
+            return
+        pos, term = self._nearby_terminal()
+        if not term or not term.get("hacked"):
+            self._sys("clearlogs: stand on or beside a rooted (!) terminal to wipe its logs.")
+            return
+        self._term_log("T1070: scrubbing EVTX/syslog artifacts and rotating timestamps...")
+        self.stats["logs_cleared"] += 1
+        self._adjust_rep(+1, "clean operator")
+        self._lower_heat(1.0)
+        self._sys("Logs wiped on " + term.get("ssid", "CastleNet") + ". Heat -1.0.")
+        ent = self._active_responder()
+        if ent:
+            if self._heat_level() < 2 or random.random() < 0.5:
+                self._despawn_responder("Trail goes cold — IR loses your implants and pulls back.")
+            else:
+                self._sys("[SOC] IR pauses at the missing logs, but keeps sweeping.")
+        self._advance_turn()
+
     def _hack_terminal_action(self, mode: str = "balanced"):
         pos, term = self._nearby_terminal()
         if not term:
@@ -2961,8 +3680,572 @@ class Game:
         if term.get("hacked"):
             self._sys(f"Terminal {term.get('ssid', 'CastleNet')} already rooted.")
             return
-        self._attempt_terminal_hack(pos, term, mode)
+        self._open_hack_overlay(pos, term)
+
+    # ── Interactive module-selection hacking ─────────────────────────────────
+
+    # Exploit-chain branches the player can toggle between (Tab) in the overlay.
+    _HACK_MODES = ("balanced", "ntlm")
+
+    def _required_modules_for_terminal(self, term: dict, mode: str | None = None) -> list[str]:
+        """Modules whose tools the terminal requires for the chosen exploit mode.
+
+        Tools with no crafting module (e.g. the built-in wifi_scan) are dropped —
+        they are always available and never need to be selected."""
+        mode = mode or self.hack_mode
+        mods: list[str] = []
+        for tool in self._required_tools_for_terminal(term, mode):
+            mod = TOOL_TO_MODULE.get(tool)
+            if mod and mod not in mods:
+                mods.append(mod)
+        return mods
+
+    def _open_hack_overlay(self, pos, term: dict):
+        self.hack_pos = pos
+        self.hack_term = term
+        self.hack_cursor = 0
+        self.hack_scroll = 0
+        self.hack_selected = set()
+        self.hack_mode = "balanced"
+        self.overlay = "hack"
+
+    def _hack_overlay_entries(self) -> list[dict]:
+        """Rows for the hack overlay. Owned modules are selectable; if the target
+        has been vulnscanned, required-but-unowned modules are shown as locked."""
+        term = self.hack_term or {}
+        scanned = bool(term.get("vulnscanned"))
+        required = set(self._required_modules_for_terminal(term))
+        owned = sorted((m for m in self.modules if m in MODULE_TO_TOOL), key=self._module_sort_key)
+        entries: list[dict] = []
+        for m in owned:
+            entries.append({
+                "module": m,
+                "owned": True,
+                "required": (m in required) if scanned else None,
+                "cd": self.module_cd.get(m, 0),
+            })
+        if scanned:
+            for m in sorted(required - set(owned)):
+                entries.append({"module": m, "owned": False, "required": True, "cd": 0})
+        return entries
+
+    def _handle_hack_overlay_key(self, ch) -> bool:
+        entries = self._hack_overlay_entries()
+        n = len(entries)
+        if ch in (27, ord("q"), ord("Q"), ord("x"), ord("X")):
+            self.overlay = None
+            self.hack_term = None
+            return True
+        if ch in (curses.KEY_UP, ord("k"), ord("K")):
+            self.hack_cursor = max(0, self.hack_cursor - 1)
+            return True
+        if ch in (curses.KEY_DOWN, ord("j"), ord("J")):
+            self.hack_cursor = min(n - 1, self.hack_cursor + 1) if n else 0
+            return True
+        if ch in (curses.KEY_PPAGE,):
+            self.hack_cursor = max(0, self.hack_cursor - 5)
+            self.hack_scroll = max(0, self.hack_scroll - 5)
+            return True
+        if ch in (curses.KEY_NPAGE,):
+            self.hack_cursor = min(n - 1, self.hack_cursor + 5) if n else 0
+            self.hack_scroll += 5
+            return True
+        if ch in (curses.KEY_HOME,):
+            self.hack_cursor = 0
+            self.hack_scroll = 0
+            return True
+        if ch in (curses.KEY_END,):
+            if n:
+                self.hack_cursor = n - 1
+                self.hack_scroll = max(0, n - 1)
+            return True
+        if n:
+            self.hack_cursor = max(0, min(self.hack_cursor, n - 1))
+        if ch == 9:  # Tab — cycle exploit-chain branch (balanced ↔ ntlm relay)
+            idx = (self._HACK_MODES.index(self.hack_mode) + 1) % len(self._HACK_MODES)
+            self.hack_mode = self._HACK_MODES[idx]
+            self.hack_selected = set()   # required set changed; clear stale picks
+            return True
+        if ch in (ord(" "),):
+            if n:
+                entry = entries[self.hack_cursor]
+                if not entry["owned"]:
+                    self._sys(f"{entry['module']} not crafted — build it at g first.")
+                elif entry["cd"] > 0:
+                    self._sys(f"{entry['module']} cooling down ({entry['cd']} turns) — "
+                              f"recently deployed.")
+                else:
+                    m = entry["module"]
+                    if m in self.hack_selected:
+                        self.hack_selected.discard(m)
+                    else:
+                        self.hack_selected.add(m)
+            return True
+        if ch in (10, 13):  # Enter — deploy selected modules
+            self._resolve_module_hack()
+            return True
+        return True
+
+    @staticmethod
+    def _rand_mac() -> str:
+        return ":".join(f"{random.randint(0, 255):02X}" for _ in range(6))
+
+    @staticmethod
+    def _rand_ip(subnet: int | None = None) -> str:
+        third = subnet if subnet is not None else random.randint(0, 255)
+        return f"10.{random.randint(0, 255)}.{third}.{random.randint(2, 254)}"
+
+    @staticmethod
+    def _rand_hex(n: int) -> str:
+        return "".join(random.choice("0123456789abcdef") for _ in range(n))
+
+    _SVC_ACCOUNTS = ("svc_sql", "svc_backup", "svc_iis", "admin", "helpdesk", "krbtgt")
+    _HOSTNAMES = ("DC01", "FILE03", "SQL02", "WS-OPS-14", "JUMP01", "CAM-NVR", "PLC-GW")
+
+    def _tool_console_lines(self, tool: str, term: dict, effective: bool) -> list[str]:
+        """Emulated console output a tool would leave in the terminal's logs.
+
+        The output is intentionally synthetic: it reads like a captured operator
+        session, but every host, credential, handshake, and success marker is
+        fabricated by the game.
+        """
+        ssid = term.get("ssid", "CastleNet")
+        control = term.get("control", "doors")
+        tier = int(term.get("tier", 1))
+        host = random.choice(self._HOSTNAMES)
+        user = random.choice(self._SVC_ACCOUNTS)
+        ip = self._rand_ip()
+        subnet = ip.rsplit(".", 1)[0]
+        gw = f"{subnet}.1"
+        mac = self._rand_mac()
+        session_id = f"SIM-{self._rand_hex(6).upper()}"
+        trace_id = self._rand_hex(10)
+        ms = random.randint(40, 980)
+        stamp = f"{random.randint(0, 23):02}:{random.randint(0, 59):02}:{random.randint(0, 59):02}"
+
+        def prompt(cmd: str) -> str:
+            return f"artkit@sim:~# {cmd}"
+
+        def t(line: str) -> str:
+            return f"[{stamp}] {line}"
+
+        def block(title: str, *lines: str) -> list[str]:
+            out = [
+                t(f"=== ARTKIT SESSION {session_id} ==="),
+                t(f"tool={tool} target={ssid} profile={control} tier=T{tier}"),
+                t(f"context host={host} user={user} ip={ip} gw={gw} mac={mac}"),
+                t(f"trace={trace_id} mode={'effective' if effective else 'no-op'}"),
+                prompt(f"{title} --target {ssid} --trace {trace_id}"),
+            ]
+            out.extend(lines)
+            out.append(t("--- synthetic output ends ---"))
+            return out
+
+        gen: dict[str, list[str]] = {
+            "wifi_scan": block(
+                "wifi-scan",
+                t("[scan] initializing monitor mode on wlan0mon"),
+                t(f"[scan] channel sweep 1-11; dwell={random.uniform(0.4, 1.4):.1f}s"),
+                t(f"[beacon] ESSID {ssid} / BSSID {mac} / signal -{random.randint(31, 69)} dBm"),
+                t(f"[inventory] {random.randint(2, 9)} APs, {random.randint(1, 14)} clients, 1 target"),
+                t("[note] synthetic recon snapshot cached for later stages"),
+            ),
+            "capture_handshake": block(
+                "capture-handshake",
+                t(f"[sniffer] locking onto BSSID {mac}"),
+                t(f"[deauth] burst {random.randint(2, 8)} sent; retransmit pressure rising"),
+                t("[capture] EAPOL 1/4 ... 2/4 ... 3/4 ... 4/4 complete"),
+                t(f"[artifact] wrote /tmp/{ssid}.pcapng ({random.randint(96, 480)} KiB)"),
+                t("[status] handshake sufficient for offline analysis"),
+            ),
+            "crack_password": block(
+                "crack-password",
+                t("[hashcat] mode=22000 attack=straight dictionary=rockyou.txt"),
+                t(f"[mask] gpu {random.randint(1, 4)} engaged; queue depth {random.randint(12, 64)}"),
+                t(f"[speed] {random.randint(80, 480)}.{random.randint(0, 9)} kH/s"),
+                t(f"[result] recovered 1/1 digests -> Castl3N3t!{random.randint(2020, 2025)}"),
+                t("[note] synthetic passphrase emitted for gameplay flow"),
+            ),
+            "signal_spoof": block(
+                "signal-spoof",
+                t(f"[spoof] cloning trusted OUI onto wlan0 -> {mac}"),
+                t(f"[identity] original MAC {self._rand_mac()} quarantined"),
+                t(f"[identity] broadcast persona now matches {random.choice(['Cisco', 'Intel', 'Ubiquiti'])} profile"),
+                t("[status] radio fingerprint shifted"),
+            ),
+            "circuit_bypass": block(
+                "circuit-bypass",
+                t("[relay] loading forged control image"),
+                t(f"[patch] fw image mapped at 0x{self._rand_hex(6)}; checksum OK"),
+                t("[graph] control-flow path rewritten; bypass window open"),
+                t("[status] actuator handshake accepted"),
+            ),
+            "privilege_escalation": block(
+                "priv-esc",
+                t(f"[kernel] build {random.randint(4, 6)}.{random.randint(0, 19)} matched known pattern"),
+                t("[spray] kmalloc-256 pressure increased"),
+                t("[trigger] token swap succeeded"),
+                t("uid=0(root) gid=0(root) groups=0(root)"),
+            ),
+            "door_override": block(
+                "door-override",
+                t(f"[bus] polling {ip}:502 with write-coil opcode"),
+                t(f"[write] coil 0x0000 <- 0xFF00 on {ip}:502"),
+                t("[mechanism] servo actuator unlocked; latch disengaged"),
+                t("[status] door matrix now obedient"),
+            ),
+            "root_shell": block(
+                "root-shell",
+                t("[stager] loading persistence shim"),
+                t(f"[session] socket opened ({ip}:4444 -> {gw}:443)"),
+                t("meterpreter > getuid"),
+                t("Server username: NT AUTHORITY\\SYSTEM"),
+                t("[status] interactive shell ready"),
+            ),
+            "loot_decrypt": block(
+                "loot-decrypt",
+                t("[crypto] opening sealed cache envelope"),
+                t(f"[key] synthetic envelope key 0x{self._rand_hex(16)} recovered"),
+                t(f"[extract] {random.randint(2, 9)} files restored into ./loot/"),
+                t("[status] archive decrypted cleanly"),
+            ),
+            "credential_dump": block(
+                "credential-dump",
+                t("[lsass] snapshot acquired; parsing logon sessions"),
+                t(f"Authentication Id : 0 ; {random.randint(100000, 999999)}"),
+                t(f"msv : NTLM : {self._rand_hex(32)}"),
+                t(f"wdigest : {user} / CASTLE.local"),
+                t("[status] credential material copied to buffer"),
+            ),
+            "keylogger": block(
+                "keylogger",
+                t("[hook] attaching to foreground process"),
+                t(f"[hook] WH_KEYBOARD_LL trampoline @0x{self._rand_hex(8)}"),
+                t(f"[buffer] {random.randint(40, 600)} keystrokes written to ks.log"),
+                t("[status] input stream mirrored"),
+            ),
+            "pass_the_hash": block(
+                "pass-the-hash",
+                t(f"[relay] launching against {user}@{ip}"),
+                t("[share] ADMIN$ reachable; staging payload"),
+                t(f"[drop] Windows\\{self._rand_hex(8)}.exe queued"),
+                t("[status] remote SYSTEM context achieved"),
+            ),
+            "pivot_relay": block(
+                "pivot-relay",
+                t(f"[tunnel] chisel client {ip}:8080 R:1080:socks"),
+                t("[link] client connected; latency 12ms"),
+                t(f"[proxy] socks5 up 127.0.0.1:1080 -> {ip}"),
+                t("[status] lateral path available"),
+            ),
+            "erase_logs": block(
+                "erase-logs",
+                t("[cleanup] clearing Security and System event channels"),
+                t(f"[cleanup] Security records purged: {random.randint(200, 4000)}"),
+                t("[cleanup] sysmon operational state cleared"),
+                t("[status] local telemetry silenced"),
+            ),
+            "process_spoof": block(
+                "process-spoof",
+                t("[mask] rewriting process image path"),
+                t(r"[mask] PEB image path -> C:\Windows\System32\svchost.exe"),
+                t(f"[mask] PID {random.randint(400, 9000)} now impersonates svchost.exe"),
+                t("[status] process lineage blurred"),
+            ),
+            "port_scan": block(
+                "port-scan",
+                t(f"[scan] nmap -sS -T4 {subnet}.0/24"),
+                t("Starting Nmap 7.94 ( https://nmap.org )"),
+                t(f"Nmap scan report for {host} ({ip})"),
+                t("22/tcp open ssh | 445/tcp open microsoft-ds | 3389/tcp open ms-wbt-server"),
+                t("[status] service map captured"),
+            ),
+            "host_discovery": block(
+                "host-discovery",
+                t("[probe] arp-scan --localnet"),
+                t(f"[find] {random.randint(4, 30)} hosts replied on {subnet}.0/24"),
+                t(f"[host] {ip}  {mac}  ({host})"),
+                t("[status] local network inventory updated"),
+            ),
+            "exploit_vuln": block(
+                "exploit-vuln",
+                t("[framework] msfconsole -q -x 'use exploit/windows/smb/ms17_010_eternalblue'"),
+                t(f"[connect] {ip}:445 -> target reachable"),
+                t(f"[payload] sending SMB buffer ({random.randint(2, 9)} kb)"),
+                t("[result] synthetic session opened -> meterpreter"),
+            ),
+            "sql_inject": block(
+                "sql-inject",
+                t(f"[probe] sqlmap -u http://{ip}/app?id=1 --dump --batch"),
+                t("[test] boolean-based blind probe -> injectable"),
+                t("[db] back-end identified as Microsoft SQL Server"),
+                t(f"[dump] {random.randint(12, 4000)} rows copied from dbo.users"),
+            ),
+            "camera_blind": block(
+                "camera-blind",
+                t(f"[rtsp] ./rtsp_blind rtsp://{ip}:554/stream1"),
+                t("[hook] H.264 frame buffer interception active"),
+                t("[screen] CCTV feed frozen on last keyframe"),
+                t("[status] camera operator sees nothing new"),
+            ),
+            "arp_poison": block(
+                "arp-poison",
+                t(f"[mitm] ettercap -T -M arp /{gw}// /{ip}//"),
+                t(f"[poison] {ip} <-> {gw} traffic redirected"),
+                t(f"[capture] {random.randint(8, 200)} packets intercepted"),
+                t("[status] layer-2 trust bent in your favor"),
+            ),
+            "kerberoast": block(
+                "kerberoast",
+                t(f"[enum] impacket-GetUserSPNs CASTLE.local/{user} -request"),
+                t("ServicePrincipalName  Name      MemberOf"),
+                t(f"MSSQL/{host}          {user}    Domain Admins"),
+                t(f"$krb5tgs$23$*{user}*$ {self._rand_hex(24)}..."),
+                t("[status] roast material cached"),
+            ),
+            "forge_token": block(
+                "forge-token",
+                t(f"[forge] impacket-ticketer -nthash {self._rand_hex(32)} -domain CASTLE.local Administrator"),
+                t("[forge] creating ticket skeleton"),
+                t("[forge] Golden ticket saved to Administrator.ccache"),
+                t("[status] forged identity ready"),
+            ),
+            "pass_the_ticket": block(
+                "pass-the-ticket",
+                t("[kerberos] kerberos::ptt Administrator.kirbi"),
+                t(f"[ticket] TGT injected into LUID 0x{self._rand_hex(5)}"),
+                t("[cache] klist shows krbtgt/CASTLE.LOCAL (forwardable, renewable)"),
+                t("[status] ticket replay live"),
+            ),
+            "shellcode_exec": block(
+                "shellcode-exec",
+                t("[inject] ./inject --pid notepad.exe --sc payload.bin"),
+                t(f"[alloc] VirtualAllocEx RWX @0x{self._rand_hex(8)} ({random.randint(200, 900)} bytes)"),
+                t("[thread] CreateRemoteThread -> running"),
+                t("[status] shellcode thread active"),
+            ),
+            "uac_escape": block(
+                "uac-escape",
+                t("[bypass] ./fodhelper_bypass.ps1"),
+                t(r"[registry] HKCU\Software\Classes\ms-settings\shell\open\command staged"),
+                t("[elevate] auto-elevate -> High Integrity (no consent prompt)"),
+                t("[status] UAC barrier bypassed"),
+            ),
+            "wmi_exec": block(
+                "wmi-exec",
+                t(f"[wmi] impacket-wmiexec {user}@{ip}"),
+                t("[query] SELECT * FROM Win32_Process via DCOM"),
+                t(f"[create] Win32_Process.Create -> PID {random.randint(400, 9000)} (SYSTEM)"),
+                t("[status] remote WMI execution confirmed"),
+            ),
+            "remote_exec": block(
+                "remote-exec",
+                t(f"[exec] impacket-psexec CASTLE/{user}@{ip}"),
+                t(f"[stage] uploading {self._rand_hex(8)}.exe to ADMIN$"),
+                t(f"[svc] opening Service Control Manager on {host}"),
+                t(r"C:\Windows\system32> whoami"),
+                t(r"nt authority\system"),
+            ),
+            "force_auth": block(
+                "force-auth",
+                t("[relay] responder -I eth0 -wF"),
+                t(f"[coerce] SMB relay: {host}\\{user} coerced via PetitPotam"),
+                t(f"[hash] NTLMv2-SSP: {user}::{self._rand_hex(48)}..."),
+                t("[status] auth coercion captured"),
+            ),
+            "lolbin_exec": block(
+                "lolbin-exec",
+                t('"[lolbin] mshta vbscript:Execute(\"...\")(window.close)"'),
+                t("[proxy] signed Microsoft binary used as launchpad"),
+                t("[status] payload executed with minimal surface"),
+            ),
+            "obfuscate": block(
+                "obfuscate",
+                t("[packer] ./packer --enc xor --sgn payload.bin"),
+                t(f"[entropy] {random.randint(70, 79) / 10:.1f} -> {random.randint(78, 99) / 10:.1f}"),
+                t(f"[evade] {random.randint(8, 40)}/{random.randint(60, 72)} AV engines bypassed"),
+                t("[status] sample rewrapped for transport"),
+            ),
+            "flash_firmware": block(
+                "flash-firmware",
+                t("[flash] flashrom -p ch341a_spi -w implant.bin"),
+                t("[flash] reading old flash chip contents... done"),
+                t("[flash] erasing, writing, verifying... VERIFIED"),
+                t("[status] firmware image replaced"),
+            ),
+        }
+
+        lines = gen.get(tool)
+        if lines is None:
+            desc = TOOL_DESCRIPTIONS.get(tool, "module executed")
+            headline = desc.split(" — ")[0] if " — " in desc else desc
+            lines = block(
+                "generic-tool",
+                t(f"[tool] loading {tool} from synthetic library"),
+                t(f"[run] ./{tool} --target {ip} --ssid {ssid}"),
+                t(f"[result] {headline} -> synthetic success ({ms} ms)"),
+                t("[status] placeholder output complete"),
+            )
+
+        if not effective:
+            lines = lines[:-1] + [
+                t(f"[warn] {tool}: target rejected this vector"),
+                t("[warn] no state change; telemetry still recorded"),
+                lines[-1],
+            ]
+
+        flat: list[str] = []
+        for ln in lines:
+            flat.extend(ln.split("\n"))
+        return flat
+
+    def _open_log_panel(self):
+        """Open the log overlay scrolled to the most recent entries."""
+        self.overlay = "log"
+        _, _, _, _, inner, content_h = self._log_overlay_geometry()
+        total = len(self._log_overlay_rows(inner))
+        self.log_scroll = max(0, total - content_h)
+
+    def _resolve_module_hack(self):
+        pos, term = self.hack_pos, self.hack_term
+        self.overlay = None
+        self.hack_term = None
+        # Consume the pivot flag now so it can't leak into a later normal hack.
+        is_pivot = self.pivot_hack
+        self.pivot_hack = False
+        mode = self.hack_mode
+        if not term:
+            return
+        ssid = term.get("ssid", "CastleNet")
+        selected = set(self.hack_selected)
+        required = set(self._required_modules_for_terminal(term, mode))
+        cred_mods = {TOOL_TO_MODULE[t] for t in _CRED_SUBSTITUTED_TOOLS
+                     if t in TOOL_TO_MODULE}
+        effective_required = required - (cred_mods if self.valid_credentials else set())
+
+        if not selected:
+            self._sys("No modules deployed — the terminal is untouched.")
+            return
+
+        wrong = selected - required
+        missing = effective_required - selected
+
+        self._sys(f"ArtHackToolKit -> target {ssid}: deploying {len(selected)} module(s)...")
+        for m in sorted(selected):
+            tool = MODULE_TO_TOOL[m]
+            is_req = m in required
+            if is_req:
+                self._sys(f"  {m:<18} -> engaged ({tool})")
+            else:
+                self._sys(f"  {m:<18} -> NO EFFECT — wrong vector, traffic logged")
+            # Emulate the tool's own console output into the terminal logs.
+            for ln in self._tool_console_lines(tool, term, effective=is_req):
+                self._term_log(ln)
+
+        # Every ineffective module is noisy: it raises threat.
+        if wrong:
+            self._raise_heat(THREAT_PER_WRONG_MODULE * len(wrong),
+                             f"{len(wrong)} wrong module(s)")
+            self._sys(f"  {len(wrong)} ineffective module(s) tripped logging "
+                      f"(+threat).")
+
+        # Deployed modules need to recharge before they can be fired again.
+        for m in selected:
+            self.module_cd[m] = _MODULE_COOLDOWN
+
+        # Per-terminal skill gate — the chosen exploit branch sets which skill gates.
+        skill_name, skill_req, player_lv = self._hack_skill_req(term, mode)
+        if term.get("tutorial"):
+            skill_req = 0   # the training terminal never gates on skill
+        if player_lv < skill_req:
+            self._sys(f"{skill_name} skill too low (Lv{player_lv}, need Lv{skill_req}). "
+                      f"Practice on a rooted terminal first.")
+            self._practice_hack(pos, term)
+            self.last_failed_hack = {"pos": pos, "term": term,
+                                     "selected": set(selected)}
+            self._sys("Press ! to retry the hack with the same modules.")
+            self._advance_turn()
+            self._open_log_panel()
+            return
+
+        if missing:
+            self._sys("Incomplete exploit chain — still need: "
+                      + ", ".join(sorted(missing)))
+            self._sys("Run 'vulnscan' to reveal exactly which modules this target needs.")
+            self._raise_heat(0.2, "incomplete chain")
+            self._practice_hack(pos, term)
+            self._advance_turn()
+            return
+
+        # Honeypot: a decoy terminal. Committing the full chain trips the trap.
+        if term.get("honeypot"):
+            term["tripped"] = True
+            self.stats["honeypots_tripped"] += 1
+            self._adjust_rep(-1, "burned by a honeypot")
+            self._raise_heat(2.0, "honeypot tripped")
+            self._gm(f"It's a honeypot! {ssid} was a decoy — your session is fingerprinted "
+                     f"and the SOC is alerted. Heat +2.0.")
+            self._term_log("DECEPTION: canary token fired — attacker TTPs logged to SIEM.")
+            if not self._active_responder():
+                self._spawn_responder()
+            self.last_failed_hack = None
+            self._advance_turn()
+            self._open_log_panel()
+            return
+
+        # Full required set deployed — roll for success.
+        base = {"easy": 0.9, "normal": 0.72, "hard": 0.55, "nightmare": 0.38}
+        cred_bonus = 0.06 if self.valid_credentials else 0.0
+        tier_penalty = 0.08 * max(0, int(term.get("tier", 1)) - 1)
+        heat_penalty = _HEAT_HACK_PENALTY[self._heat_level()]
+        clean_bonus = 0.05 if not wrong else 0.0   # reward a surgical, no-noise run
+        pivot_penalty = 0.12 if is_pivot else 0.0   # remote hacks are harder
+        chance = max(0.08, base.get(self.difficulty, 0.72) + cred_bonus
+                     + self.firmware_bonus - tier_penalty - heat_penalty
+                     + clean_bonus - pivot_penalty)
+        if term.get("tutorial"):
+            chance = 1.0   # the training terminal cannot fail
+
+        if random.random() >= chance:
+            self._raise_heat(_MODE_HEAT.get(mode, 0.30) * 0.5, "failed hack")
+            self._gm("The terminal rejects your packet burst. Encryption rotates "
+                     "and locks you out.")
+            self.last_failed_hack = {"pos": pos, "term": term,
+                                     "selected": set(selected)}
+            self._sys("Press ! to retry the hack with the same modules.")
+            self._advance_turn()
+            self._open_log_panel()
+            return
+
+        self._raise_heat(_MODE_HEAT.get(mode, 0.30), "successful hack")
+        self.last_failed_hack = None
+        self.stats["terminals_rooted"] += 1
+        self._contract_progress("root")
+        self.skills["exploit"] = self.skills.get("exploit", 0) + self.xp_mult
+        term["hacked"] = True
+        self._apply_terminal_effect(pos, term)
+        res_type = _TERMINAL_RESOURCE.get(term.get("control", "doors"))
+        if res_type:
+            self._sys(f"Root obtained on {ssid}. Type 'botnet' to install a C2 node "
+                      f"and bring [{res_type}] online.")
         self._advance_turn()
+        self._open_log_panel()
+
+    def _retry_failed_hack(self):
+        """Re-run the most recent failed hack with the same module loadout (!)."""
+        last = self.last_failed_hack
+        if not last:
+            self._sys("No failed hack to retry.")
+            return
+        term = last["term"]
+        if term.get("hacked"):
+            self._sys(f"Terminal {term.get('ssid', 'CastleNet')} already rooted.")
+            self.last_failed_hack = None
+            return
+        self.hack_pos = last["pos"]
+        self.hack_term = term
+        self.hack_selected = set(last["selected"])
+        self._resolve_module_hack()
 
     def _required_tools_for_terminal(self, term: dict, mode: str) -> list[str]:
         # T1187 NTLM relay: coerce auth rather than cracking — swap crack_password for force_auth
@@ -3136,10 +4419,23 @@ class Game:
 
         # Resource gate: certain tools require infrastructure (GPU/cloud/relay/compute)
         missing_res: list[tuple[str, str]] = []
+        current_level = getattr(self.b, "level", 0)
+        level_terminals = [
+            spec for spec in self.b.specials.values()
+            if spec.get("kind") == "terminal"
+        ]
         for tool in req:
             res = _TOOL_RESOURCE.get(tool)
             if res and not self.resources.get(res):
                 missing_res.append((tool, res))
+        if missing_res:
+            resource_ready = {
+                res for _, res in missing_res
+                if any(_TERMINAL_RESOURCE.get(term.get("control", "")) == res
+                       for term in level_terminals)
+            }
+            if current_level < 2 or not resource_ready:
+                missing_res = []
         if missing_res:
             self._sys("Missing infrastructure resources:")
             for tool, res in missing_res:
@@ -3344,10 +4640,11 @@ class Game:
                     ent.sight_radius = max(3, ent.sight_radius - 4)
                     count += 1
             self._lower_heat(1.5)
+            self._add_env_effect("cameras blinded", 30, enemy_sight=-3)
             opened = self._unlock_terminal_security(ssid, pos)
             self._gm(
                 f"T1562: CCTV frame-buffer hooks overwritten. {count} patrol units blinded. "
-                f"Sight radius reduced. {opened} camera-linked locks disengaged. Heat -1.5"
+                f"Sight radius reduced for 30 turns. {opened} camera-linked locks disengaged. Heat -1.5"
             )
             return
 
@@ -3359,10 +4656,12 @@ class Game:
                     ent.alerted = False
                     count += 1
             self._lower_heat(2.0)
+            self._add_env_effect("alarms spoofed", 30, suppress_spot_heat=True)
             opened = self._unlock_terminal_security(ssid, pos)
             self._gm(
                 f"T1036/T1583: Alarm daemon spoofed. "
-                f"{count} alerted patrols stand down. {opened} alarm-linked gates open. Heat -2.0"
+                f"{count} alerted patrols stand down. Being spotted won't raise heat for 30 turns. "
+                f"{opened} alarm-linked gates open. Heat -2.0"
             )
             return
 
@@ -3408,9 +4707,11 @@ class Game:
                     if self.b.get(rx, ry) != VOID:
                         self.b.seen.add((rx, ry))
             self._unlock_terminal_security(ssid, pos)
+            self._add_env_effect("grid destabilized", 25, patrol_freeze=True)
             self._gm(
                 "T1574/T1203: Power-grid firmware exploited. Emergency lighting fires across the wing. "
-                "All unlocked doors snap open. Surrounding architecture illuminated."
+                "All unlocked doors snap open. Surrounding architecture illuminated. "
+                "Patrols are disoriented and hold position for 25 turns."
             )
             return
 
@@ -3956,8 +5257,8 @@ class Game:
                 return
             if self.b.phase in ("escape", "flee") and random.random() < 0.4:
                 x, y = self._free_near(self.b.px, self.b.py)
-                self.b.add_item(x, y, "k", "iron key", "heavy and cold", "key")
-                self._gm("Half-buried in the straw: a key.")
+                self.b.add_item(x, y, "$", "rusted coin", "dusty and old", "item")
+                self._gm("Half-buried in the straw: a rusted coin.")
                 return
             self._gm("You search, but find only dust and old fear.")
         else:
@@ -4003,6 +5304,11 @@ class Game:
         self.log.append(("sys", text))
         self._trim_log()
 
+    def _term_log(self, text):
+        """Emulated tool console output, styled like a captured terminal session."""
+        self.log.append(("term", text))
+        self._trim_log()
+
     def _trim_log(self):
         if len(self.log) > 200:
             self.log = self.log[-200:]
@@ -4010,6 +5316,29 @@ class Game:
     def _win(self):
         self.won = True
         self.b.phase = "win"
+        self._new_daily_best = False
+        self._save_run_results()
+
+    def _summary_lines(self) -> list[str]:
+        s = self.stats
+        lines = [
+            f"Turns played ......... {self.turn_count}",
+            f"Terminals rooted ..... {s['terminals_rooted']}",
+            f"Honeypots tripped .... {s['honeypots_tripped']}",
+            f"Modules crafted ...... {s['modules_crafted']}",
+            f"C2 pivots ............ {s['pivots']}",
+            f"Logs wiped ........... {s['logs_cleared']}",
+            f"Contracts completed .. {s['contracts_done']}/{len(self.contracts)}",
+            f"Peak heat ............ {self._heat_peak:.1f}/5.0",
+            f"Street cred .......... {self.rep:+d}",
+            f"Clues found .......... {self.clues}/{CLUES_FOR_PORTAL}",
+            f"Lifetime wins ........ {self.profile.get('wins', 0)}",
+        ]
+        if self.daily:
+            lines.append(f"Daily score .......... {self._daily_score()}"
+                         + ("   ★ NEW BEST!" if getattr(self, "_new_daily_best", False)
+                            else f"   (best {self.profile.get('best_daily', '-')})"))
+        return lines
 
     # ===================================================================
     #  rendering
@@ -4127,6 +5456,15 @@ class Game:
         if self.stealth_mode:
             snk = self._stealth_bonus()
             y = self._side(left, y, f" [SNEAK  -{snk} detect]", self._attr(5, True))
+        # Blue-team incident response warning
+        if self._active_responder():
+            y = self._side(left, y, " [SOC IR HUNTING] press - to wipe logs",
+                           self._attr(9, True))
+        # Active environmental effects from hacked control systems
+        for fx in self.active_effects:
+            if fx.get("env"):
+                y = self._side(left, y, f" [{fx['name']} {fx.get('duration', 0)}t]",
+                               self._attr(5, True))
         # Netrunner passive: reveals nearest terminal type within 5 tiles
         if self.archetype == "netrunner":
             hit = self._nearest_terminal(max_dist=5)
@@ -4136,6 +5474,10 @@ class Game:
                 rooted = " [ROOTED]" if term.get("rooted") else ""
                 y = self._side(left, y, f" NET: {ctrl}{rooted}", self._attr(3, True))
         y = self._side(left, y, f" coin: {self._coins_text(self.wallet_cp)}", self._attr(5))
+        done = sum(1 for c in self.contracts if c["done"])
+        if self.contracts:
+            y = self._side(left, y, f" jobs {done}/{len(self.contracts)}  cred {self.rep:+d}",
+                           self._attr(5))
         y = self._side(left, y,
                        f" load: {self._carry_weight():.1f}/{self._effective_max_weight():.1f}",
                        self._attr(11))
@@ -4164,8 +5506,13 @@ class Game:
         y = self._side(left, y, "KEYS", self._attr(10, True))
         for line in ("move WASD/arrows", "z shoot  v sneak",
                      "x hack terminal (!)",
+                     "! retry failed hack",
+                     "- wipe logs (drop heat)",
+                     "= run summary",
                      "u skills   p toolkit  g craft",
-                     "l look   e search   f fight",
+                     "o log panel   n contracts",
+                     "l look   e search   A auto-loot   f fight",
+                     "cmds: pivot botnet vulnscan",
                      "equip <name> / drink <name>", "shop / buy <n> / sell <name>",
                      "t type an action", "? help   q quit"):
             y = self._side(left, y, " " + line, self._attr(11))
@@ -4182,9 +5529,108 @@ class Game:
             for ln in wrapped:
                 lines.append((speaker, ln))
         for i, (speaker, ln) in enumerate(lines[-height:]):
-            attr = self._attr(1, True) if speaker == "gm" else self._attr(11)
-            prefix = "» " if speaker == "gm" else "· "
+            if speaker == "gm":
+                attr, prefix = self._attr(1, True), "» "
+            elif speaker == "term":
+                # Emulated tool output carries its own prompt/indent structure.
+                attr, prefix = self._attr(8), ""
+            else:
+                attr, prefix = self._attr(11), "· "
             self._put(top + i, left, prefix + ln, attr)
+
+    def _log_overlay_geometry(self):
+        h, w = self.scr.getmaxyx()
+        bw = max(30, w - 4)
+        bh = max(8, h - 4)
+        top = max(0, (h - bh) // 2)
+        left = max(0, (w - bw) // 2)
+        inner = max(1, bw - 4)
+        content_h = max(1, bh - 4)
+        return top, left, bw, bh, inner, content_h
+
+    def _log_overlay_rows(self, inner_w: int):
+        rows: list[tuple[str, str]] = []
+        max_w = max(1, inner_w)
+        for speaker, text in self.log:
+            if speaker == "gm":
+                prefix = "» "
+            elif speaker == "term":
+                prefix = ""
+            else:
+                prefix = "· "
+            wrap_w = max(1, max_w - len(prefix))
+            wrapped = textwrap.wrap(str(text), wrap_w) or [""]
+            for i, ln in enumerate(wrapped):
+                pad = " " * len(prefix) if prefix else ""
+                rows.append((speaker, (prefix if i == 0 else pad) + ln))
+        if not rows:
+            rows.append(("sys", "(no log entries yet)"))
+        return rows
+
+    def _draw_log_overlay(self):
+        top, left, bw, bh, inner, content_h = self._log_overlay_geometry()
+        rows = self._log_overlay_rows(inner)
+        max_scroll = max(0, len(rows) - content_h)
+        self.log_scroll = max(0, min(self.log_scroll, max_scroll))
+        visible = rows[self.log_scroll:self.log_scroll + content_h]
+
+        acc = self._attr(10, True)
+        self._put(top, left, "+" + "-" * (bw - 2) + "+", acc)
+        self._put(top, left + 3, " EVENT LOG ", acc)
+        for i in range(1, bh - 1):
+            self._put(top + i, left, "|", acc)
+            self._put(top + i, left + bw - 1, "|", acc)
+        self._put(top + bh - 1, left, "+" + "-" * (bw - 2) + "+", acc)
+
+        for i, (speaker, ln) in enumerate(visible):
+            if speaker == "gm":
+                attr = self._attr(1, True)
+            elif speaker == "term":
+                attr = self._attr(8)
+            else:
+                attr = self._attr(11)
+            self._put(top + 2 + i, left + 2, ln[:inner], attr)
+
+        page = 1 if not rows else (self.log_scroll // max(1, content_h)) + 1
+        max_page = max(1, ((len(rows) - 1) // max(1, content_h)) + 1)
+        foot = f" up/down,j/k scroll  PgUp/PgDn page  Home/End jump  q/esc/o close  [{page}/{max_page}] "
+        self._put(top + bh - 1, left + max(1, bw - 2 - len(foot)), foot, self._attr(11))
+
+    def _handle_log_overlay_key(self, ch) -> bool:
+        if ch in (27, ord("q"), ord("Q"), ord("o"), ord("O")):
+            self.overlay = None
+            return True
+        # Retry the last failed hack or start a new one without leaving the log.
+        if ch == ord("!"):
+            self._retry_failed_hack()
+            return True
+        if ch in (ord("x"), ord("X")):
+            self._hack_terminal_action()
+            return True
+
+        _, _, _, _, inner, content_h = self._log_overlay_geometry()
+        total = len(self._log_overlay_rows(inner))
+        max_scroll = max(0, total - content_h)
+
+        if ch in (curses.KEY_UP, ord("k"), ord("K")):
+            self.log_scroll = max(0, self.log_scroll - 1)
+            return True
+        if ch in (curses.KEY_DOWN, ord("j"), ord("J")):
+            self.log_scroll = min(max_scroll, self.log_scroll + 1)
+            return True
+        if ch == curses.KEY_PPAGE:
+            self.log_scroll = max(0, self.log_scroll - content_h)
+            return True
+        if ch == curses.KEY_NPAGE:
+            self.log_scroll = min(max_scroll, self.log_scroll + content_h)
+            return True
+        if ch == curses.KEY_HOME:
+            self.log_scroll = 0
+            return True
+        if ch == curses.KEY_END:
+            self.log_scroll = max_scroll
+            return True
+        return True
 
     def _draw_prompt(self, y, left, w):
         if self.cmd_mode:
@@ -4201,7 +5647,7 @@ class Game:
             self._put(y, left, self.status_note[:w - 1], self._attr(3))
         else:
             hint = ("[WASD] move  [l]ook  [e]search  [t]ype  [c]ommands  "
-                    "[x]hack  [p]toolkit  [?]help  [q]uit")
+                "[x]hack  [o]log  [p]toolkit  [?]help  [q]uit")
             self._put(y, left, hint[:w - 1], self._attr(11))
 
     def _draw_overlay(self, h, w):
@@ -4215,14 +5661,20 @@ class Game:
             self._draw_shop_overlay(h, w)
         elif self.overlay == "craft":
             self._draw_craft_overlay(h, w)
+        elif self.overlay == "hack":
+            self._draw_hack_overlay(h, w)
         elif self.overlay == "toolkit":
             self._panel(h, w, "ARTHACKTOOLKIT", self._toolkit_lines())
         elif self.overlay == "journal":
-            self._panel(h, w, "JOURNAL — clues", self._journal_lines())
+            self._panel(h, w, "JOURNAL — contracts & clues", self._journal_lines())
+        elif self.overlay == "log":
+            self._draw_log_overlay()
         elif self.overlay == "map":
             self._draw_minimap(h, w)
         elif self.overlay == "skills":
             self._panel(h, w, "SKILLS", self._skills_lines())
+        elif self.overlay == "summary":
+            self._panel(h, w, "RUN SO FAR", self._summary_lines())
 
     def _draw_inventory_overlay(self, h, w):
         lines = self._inventory_lines()
@@ -4231,13 +5683,19 @@ class Game:
         inner = min(inner, w - 6)
         bw = inner + 4
 
-        max_content = h - 4  # lines that fit between borders/title/footer
-        need_scroll = len(lines) > max_content
-        content_h = max_content if need_scroll else len(lines)
-        bh = content_h + 4
+        footer_idx = next((i for i, ln in enumerate(lines) if ln == "Inventory controls:"), len(lines))
+        footer_start = max(0, footer_idx - 1) if footer_idx < len(lines) else len(lines)
+        body = lines[:footer_start]
+        footer = lines[footer_start:] if footer_start < len(lines) else []
+        footer_h = len(footer)
+
+        max_content = max(1, h - 4 - footer_h)  # leave room for pinned footer
+        need_scroll = len(body) > max_content
+        content_h = max_content if need_scroll else len(body)
+        bh = content_h + 4 + footer_h
 
         # Find which line is currently selected (starts with "> ")
-        cursor_line = next((i for i, ln in enumerate(lines) if ln[:2] == "> "), None)
+        cursor_line = next((i for i, ln in enumerate(body) if ln[:2] == "> "), None)
 
         if need_scroll and cursor_line is not None:
             if cursor_line < self.inv_scroll:
@@ -4246,9 +5704,9 @@ class Game:
                 self.inv_scroll = cursor_line - content_h + 1
         elif not need_scroll:
             self.inv_scroll = 0
-        self.inv_scroll = max(0, min(self.inv_scroll, len(lines) - content_h))
+        self.inv_scroll = max(0, min(self.inv_scroll, max(0, len(body) - content_h)))
 
-        visible = lines[self.inv_scroll:self.inv_scroll + content_h]
+        visible = body[self.inv_scroll:self.inv_scroll + content_h]
 
         top = max(0, (h - bh) // 2)
         left = max(0, (w - bw) // 2)
@@ -4269,15 +5727,132 @@ class Game:
                 attr = self._attr(1)
             self._put(top + 2 + i, left + 2, ln[:inner], attr)
 
+        footer_top = top + 2 + content_h
+        for i, ln in enumerate(footer):
+            if ln.startswith("──"):
+                attr = self._attr(10, True)
+            elif ln[:1].isalpha() and ln == ln.upper() and ln.strip():
+                attr = self._attr(8, True)
+            else:
+                attr = self._attr(1)
+            self._put(footer_top + i, left + 2, ln[:inner], attr)
+
         if need_scroll:
             if self.inv_scroll > 0:
                 self._put(top + 1, left + bw - 2, "^", acc)
-            if self.inv_scroll + content_h < len(lines):
+            if self.inv_scroll + content_h < len(body):
                 self._put(top + bh - 2, left + bw - 2, "v", acc)
-            foot = f" {self.inv_scroll + 1}-{self.inv_scroll + content_h}/{len(lines)} "
+            foot = f" {self.inv_scroll + 1}-{self.inv_scroll + content_h}/{len(body)} "
         else:
             foot = " press any key "
         self._put(top + bh - 1, left + bw - 2 - len(foot), foot, self._attr(11))
+
+    def _draw_hack_overlay(self, h, w):
+        term = self.hack_term
+        if not term:
+            self.overlay = None
+            return
+        ssid = term.get("ssid", "CastleNet")
+        control = term.get("control", "doors")
+        tier = int(term.get("tier", 1))
+        scanned = bool(term.get("vulnscanned"))
+        entries = self._hack_overlay_entries()
+
+        mode_label = {"balanced": "balanced (crack→exploit)",
+                      "ntlm": "ntlm relay (force_auth→creds)"}.get(self.hack_mode, self.hack_mode)
+        title = f"HACK {ssid}"
+        header = [
+            f"profile={control}  tier=T{tier}  "
+            + ("vulnscan: DONE" if scanned else "vulnscan: not run"),
+            f"branch=[{mode_label}]  ([tab] switch exploit chain)",
+            ("Required modules revealed (*). " if scanned
+             else "Run 'vulnscan' to reveal which modules work. "),
+            "Wrong modules raise THREAT. Deploy the full required set to root.",
+            "",
+        ]
+        if term.get("tutorial"):
+            header[2:2] = [
+                "TUTORIAL: run 'vulnscan' to see required modules, select each",
+                "with [space], then press [enter]. This terminal can't fail.",
+            ]
+        rows: list[str] = []
+        if not entries:
+            rows.append("(no deployable modules — craft some at g)")
+        for i, e in enumerate(entries):
+            m = e["module"]
+            tool = MODULE_TO_TOOL.get(m, "")
+            cursor = "> " if i == self.hack_cursor else "  "
+            if not e["owned"]:
+                box = "[--]"
+                tag = " *needed* (not crafted)"
+            elif e.get("cd", 0) > 0:
+                box = "[~]".ljust(4)
+                tag = f" cooling {e['cd']}t"
+            else:
+                box = "[x]" if m in self.hack_selected else "[ ]"
+                box = box.ljust(4)
+                if e["required"] is True:
+                    tag = " *required*"
+                elif e["required"] is False:
+                    tag = " (no effect here)"
+                else:
+                    tag = ""
+            rows.append(f"{cursor}{box} {m:<18} {tool:<18}{tag}")
+
+        sel_n = len(self.hack_selected)
+        footer = [
+            "",
+            f"selected: {sel_n}   "
+            "[space] toggle  [tab] branch  [enter] deploy  [q/esc] cancel",
+        ]
+        lines = header + rows + footer
+
+        inner = max(len(title), max((len(ln) for ln in lines), default=0), 40)
+        inner = min(inner, w - 6)
+        bw = inner + 4
+        max_content = h - 4
+        # Only the row region scrolls; keep header/footer pinned by clamping cursor.
+        need_scroll = len(lines) > max_content
+        content_h = max_content if need_scroll else len(lines)
+        bh = content_h + 4
+
+        cursor_line = len(header) + self.hack_cursor if entries else 0
+        if need_scroll:
+            if cursor_line < self.hack_scroll:
+                self.hack_scroll = cursor_line
+            elif cursor_line >= self.hack_scroll + content_h:
+                self.hack_scroll = cursor_line - content_h + 1
+        else:
+            self.hack_scroll = 0
+        self.hack_scroll = max(0, min(self.hack_scroll, max(0, len(lines) - content_h)))
+        visible = lines[self.hack_scroll:self.hack_scroll + content_h]
+
+        top = max(0, (h - bh) // 2)
+        left = max(0, (w - bw) // 2)
+        acc = self._attr(10, True)
+        self._put(top, left, "+" + "-" * (bw - 2) + "+", acc)
+        self._put(top, left + 3, f" {title} ", acc)
+        for i in range(1, bh - 1):
+            self._put(top + i, left, "|", acc)
+            self._put(top + i, left + bw - 1, "|", acc)
+        self._put(top + bh - 1, left, "+" + "-" * (bw - 2) + "+", acc)
+
+        for i, ln in enumerate(visible):
+            if ln.startswith("> "):
+                attr = self._attr(6, True)
+            elif "*required*" in ln or "*needed*" in ln:
+                attr = self._attr(3)
+            elif "no effect" in ln:
+                attr = self._attr(8)
+            else:
+                attr = self._attr(1)
+            self._put(top + 2 + i, left + 2, ln[:inner], attr)
+
+        if need_scroll:
+            if self.hack_scroll > 0:
+                self._put(top + 1, left + bw - 2, "^", acc)
+            if self.hack_scroll + content_h < len(lines):
+                self._put(top + bh - 2, left + bw - 2, "v", acc)
 
     def _draw_shop_overlay(self, h, w):
         _, shop = self._nearby_shop()
@@ -4308,6 +5883,7 @@ class Game:
 
         # Build display lines (with group headers); track which display line the cursor is on
         display_lines: list[str] = []
+        display_attrs: list = []
         cursor_display_line = 0
         for kind in self._SHOP_KIND_ORDER:
             group = groups.get(kind, [])
@@ -4315,22 +5891,28 @@ class Game:
                 continue
             label = self._SHOP_KIND_LABELS.get(kind, kind.upper())
             display_lines.append(f"── {label} ──")
+            display_attrs.append(self._attr(10, True))
             for entry_idx, e in group:
                 if entry_idx == cursor_entry_idx:
                     cursor_display_line = len(display_lines)
                 mark = ">" if entry_idx == cursor_entry_idx else " "
                 if is_buy:
                     cost = self._coins_text(int(e.get("value_cp", 0) or 0))
+                    rarity = e.get("rarity", "common")
                     display_lines.append(
                         f"{mark} {entry_idx + 1:02d} {e.get('name', 'item')} [{e.get('rarity', 'common')}] {cost}"
                     )
+                    display_attrs.append(self._rarity_attr(rarity, bold=(entry_idx == cursor_entry_idx)))
                 else:
                     payout = max(1, int(int(getattr(e, "value_cp", 80) or 80) * 0.6))
+                    rarity = getattr(e, "rarity", "common")
                     display_lines.append(
                         f"{mark} {e.name} ({e.kind})  → {self._coins_text(payout)}"
                     )
+                    display_attrs.append(self._rarity_attr(rarity, bold=(entry_idx == cursor_entry_idx)))
         if not display_lines:
             display_lines = ["  (sold out)" if is_buy else "  (nothing to sell)"]
+            display_attrs = [self._attr(1)]
 
         # Fixed header / footer text
         buy_lbl   = "[BUY]"  if is_buy else " BUY "
@@ -4373,6 +5955,7 @@ class Game:
             self.shop_scroll = 0
 
         visible = display_lines[self.shop_scroll:self.shop_scroll + scroll_h]
+        visible_attrs = display_attrs[self.shop_scroll:self.shop_scroll + scroll_h]
 
         # Render
         top  = max(0, (h - bh) // 2)
@@ -4402,13 +5985,7 @@ class Game:
 
         # Scrollable display lines
         for i, ln in enumerate(visible):
-            if ln.startswith("──"):
-                attr = self._attr(10, True)
-            elif ln[:1] == ">":
-                attr = self._attr(3, True)
-            else:
-                attr = self._attr(1)
-            self._put(top + 4 + i, left + 2, ln[:inner], attr)
+            self._put(top + 4 + i, left + 2, ln[:inner], visible_attrs[i])
 
         # Fixed footer row (controls)
         self._put(top + 4 + scroll_h, left + 2, ctrl_ln[:inner], self._attr(11))
@@ -4636,8 +6213,20 @@ class Game:
             "  l   look around          e / Space  search for hidden things",
             "  f   confront whoever is near (talk / distract / slip past)",
             "  x   hack nearby terminal (!) with ArtHackToolKit",
+            "  !   retry the last failed hack with the same modules",
+            "  -   wipe logs at a rooted terminal (drop heat, shake the SOC)",
+            "  =   run summary (stats so far)",
             "  r   rest and listen a moment",
             "  t or /   type a free action for the game master",
+            "",
+            "ADVANCED OPS (typed commands)",
+            "  vulnscan / portscan   recon a terminal before hacking",
+            "  botnet                install a C2 node on a rooted terminal",
+            "  pivot                 tunnel a hack through a C2 node to a distant !",
+            "  clearlogs             wipe logs (same as -)",
+            "  contracts             view side-jobs & street cred",
+            "  in the hack menu: [tab] switches exploit branch (crack ↔ ntlm relay)",
+            "  beware HONEYPOT terminals — vulnscan reveals them before you commit",
             "",
             "TOOLKIT + DIFFICULTY",
             "  p   open toolkit panel (modules, tools, quickstart)",
@@ -4653,8 +6242,8 @@ class Game:
             "  craft at an anvil (A) or crafting table (F); socket gems into armor",
             "",
             "PANELS",
-            "  i   inventory     m   map of where you've been",
-            "  n   journal of clues you've found",
+            "  i   inventory     m   map of where you've been   o log panel",
+            "  n   journal of clues you've found (from searching)",
             "  u   skills panel (melee / ranged / tech levels)",
             "  c   this list     ?   help & story",
             "",
@@ -4682,7 +6271,7 @@ class Game:
 
         idx = 0
         if self.inv_tab == "modules":
-            installed = sorted(self.modules)
+            installed = sorted(self.modules, key=self._module_sort_key)
             lines.append(f"Installed ({len(installed)}):")
             if installed:
                 for mod in installed:
@@ -4738,6 +6327,7 @@ class Game:
             lines += ["", "Inventory controls:",
                       "  Tab switch tab  Up/Down move",
                       "  Enter/X inspect  E equip/unequip  U use item",
+                      "  M move between bag/backpack  D drop to floor",
                       "  I/Q/Esc close"]
 
         else:  # gear
@@ -4818,15 +6408,27 @@ class Game:
         return lines
 
     def _journal_lines(self):
+        lines = self._contract_lines() + [""]
         if not self.journal:
-            return ["No clues yet.",
-                    "Once you're back inside the castle, SEARCH rooms (e)",
-                    "to find notes that point to the hidden portal."]
-        lines = [f"Clues found: {self.clues}/{CLUES_FOR_PORTAL}", ""]
+            lines += ["No clues yet.",
+                      "Once you're back inside the castle, SEARCH rooms (e)",
+                      "to find notes that point to the hidden portal."]
+            return lines
+        lines += [f"Clues found: {self.clues}/{CLUES_FOR_PORTAL}", ""]
         for i, c in enumerate(self.journal, 1):
             lines.append(f"{i}. {c}")
         if self.clues >= CLUES_FOR_PORTAL:
             lines += ["", "The clues align — find the hidden room with the portal (O)."]
+        return lines
+
+    def _contract_lines(self):
+        lines = [f"CONTRACTS   (street cred: {self.rep:+d})"]
+        if not self.contracts:
+            lines.append("  none active")
+            return lines
+        for c in self.contracts:
+            mark = "✓" if c["done"] else f"{c['progress']}/{c['target']}"
+            lines.append(f"  [{mark}] {c['desc']} — {self._coins_text(c['reward_cp'])}")
         return lines
 
     def _skills_lines(self):
@@ -4908,7 +6510,7 @@ class Game:
             "Unlocked modules:",
         ]
         if self.modules:
-            lines.extend(f"  - {m}" for m in sorted(self.modules))
+            lines.extend(f"  - {m}" for m in sorted(self.modules, key=self._module_sort_key))
         else:
             lines.append("  - none yet (loot from monsters/villains/animals)")
         lines += ["", "Unlocked tools:"]
@@ -4937,7 +6539,7 @@ class Game:
             "",
             f"Valid Credentials: {cred_str}",
             f"Firmware bonus:    {fw_str}",
-            f"Tech Skill:        Lv{self.skills['tech']}",
+            f"Tech Skill:        Lv{self._skill_level('tech')}",
             f"Alert Level:       [{heat_bar}] {heat_lv}/5 {_HEAT_LABELS[heat_lv]}"
             + (f" (−{int(heat_pen*100)}% hack chance)" if heat_pen else ""),
             f"Stealth:           {'ACTIVE (−' + str(self._stealth_bonus()) + ' detect)' if self.stealth_mode else 'off (v to toggle)'}",
@@ -5049,11 +6651,12 @@ class Game:
             "  Move ............ Arrow keys or W A S D (also h j k)",
             "  Open new area ... walk onto a + door, then push into the dark beyond",
             "  Look l   Search e/Space   Confront f   Hack x   Rest r   Type t",
-            "  Panels .......... i inventory   p toolkit   m map   n journal",
+            "  Panels .......... i inventory   p toolkit   m map   n journal   o log",
             "  Gear ............ equip <name> / unequip <slot> (ring1..ring10)",
             "  Jewelry ......... rings and amulets can increase sight radius",
             "  Potions ......... drink <name> (active timed effects)",
             "  Shops ........... shop / buy <n> / sell <name> while near %",
+            "  Loot ............ A auto-loot room floor first, then chests",
             "  Crafting ........ press g near an anvil (A) or table (F) to craft",
             "  Gems ............ socket gems (^) into armor to boost its stats",
             "  Loot ............ every room holds loot; open chests (X) by stepping on",
@@ -5081,10 +6684,10 @@ class Game:
             "",
             "Art steps through the portal — and into the warm light of home.",
             "",
-            f"Clues found: {self.clues}    Rooms explored: {len(self.b.rooms)}",
-            "",
-            "THE END.   Press any key to leave the dungeon behind.",
+            "── RUN SUMMARY ──",
         ]
+        art += self._summary_lines()
+        art += ["", "THE END.   Press any key to leave the dungeon behind."]
         top = max(0, (h - len(art)) // 2)
         for i, ln in enumerate(art):
             self._put(top + i, max(0, (w - len(ln)) // 2), ln,

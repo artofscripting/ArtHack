@@ -9,6 +9,7 @@ Run from a terminal on Linux:
 from __future__ import annotations
 
 import argparse
+import datetime
 import random
 import sys
 
@@ -21,19 +22,25 @@ def parse_args(argv=None):
                    help="seed the procedural generator for repeatable layouts")
     p.add_argument("--start-bonus", action="store_true",
                    help="spawn a debug kit (weapon, haversack, gems, modules) and triple XP gain")
+    p.add_argument("--daily", action="store_true",
+                   help="play today's daily-seed challenge and record your best score")
     return p.parse_args(argv)
 
 
 def main(argv=None) -> int:
     args = parse_args(argv)
-    if args.seed is not None:
+    daily = args.daily
+    if daily:
+        # Everyone playing on the same date gets the same dungeon.
+        random.seed(int(datetime.date.today().strftime("%Y%m%d")))
+    elif args.seed is not None:
         random.seed(args.seed)
 
     if not sys.stdout.isatty():
         print("ART must be run in an interactive terminal.", file=sys.stderr)
         return 2
 
-    Game(start_bonus=args.start_bonus).run()
+    Game(start_bonus=args.start_bonus, daily=daily).run()
     print("Farewell, Art.")
     return 0
 

@@ -80,6 +80,9 @@ cd /mnt/DATA/PycharmProjects/ArtHack
 
 # Debug kit + triple XP
 .venv/bin/python main.py --start-bonus
+
+# Daily-seed challenge (same dungeon for everyone today; records your best score)
+.venv/bin/python main.py --daily
 ```
 
 ---
@@ -155,6 +158,9 @@ pip install flask flask-socketio
 | `e` / `Space` | Search the current area for hidden items |
 | `f` | Confront nearby enemy or NPC (talk, distract, slip past) |
 | `x` | Hack the nearest `!` terminal (balanced mode) |
+| `!` | Retry the last failed hack with the same modules |
+| `-` | Wipe logs at a rooted terminal (drop heat, shake off the SOC) |
+| `=` | Run summary (live stats) |
 | `r` | Rest one turn |
 | `v` | Toggle stealth / sneak mode |
 | `z` | Toggle shoot mode (ranged weapon must be equipped) |
@@ -169,7 +175,7 @@ pip install flask flask-socketio
 | `t` or `/` | ArtHackToolKit (modules, tools, resources) |
 | `u` | Skills panel (weapon + hacking sub-skills) |
 | `m` | Minimap of explored areas |
-| `n` | Journal — collected clues |
+| `n` | Journal — contracts & collected clues |
 | `c` | Command list |
 | `?` | Help & story |
 | `q` | Quit |
@@ -186,6 +192,9 @@ Press Enter to open the command prompt:
 | `vulnscan` / `vs` | Full CVE + tool/skill/resource gap report |
 | `practice <skill>` | Safe skill drill on a rooted terminal |
 | `botnet` | Install C2 implant on rooted terminal → resource online |
+| `pivot` | Tunnel a hack through a C2 node to a distant terminal |
+| `clearlogs` | Wipe logs at a rooted terminal (same as `-`) |
+| `contracts` | View active side-jobs and street cred |
 | `equip <name>` | Equip item from inventory |
 | `unequip <slot>` | Unequip a slot (weapon, head, chest, legs, shield, back, amulet, ringN) |
 | `drink <name>` | Use a potion or consumable |
@@ -194,6 +203,59 @@ Press Enter to open the command prompt:
 | `shop` | Open shop panel |
 | `difficulty easy\|normal\|hard\|nightmare` | Change difficulty |
 | `too hard` / `too easy` | Nudge difficulty one step |
+
+---
+
+## Active Defense & Advanced Hacking
+
+The castle network fights back. These systems turn heat from a passive penalty into a
+living cat-and-mouse, and give your infrastructure and choices real weight.
+
+### Blue-team incident response (`B`)
+When **heat** reaches level 3+ and you hold rooted terminals, a SOC **incident-response
+unit** (`B`) deploys and hunts your implants. It pathfinds to your nearest rooted terminal
+and **re-secures** it — revoking root, killing its botnet node, and taking its resource
+offline. Watch the log for *tells* ("footsteps in the server aisle") as it closes in.
+Counter it by lowering heat (press `-` to **wipe logs** with a `log_wiper` module), or fight
+it — but violence costs **street cred**.
+
+### Honeypots
+~1 in 8 terminals is a **decoy**. Hacking one doesn't grant control: it fingerprints you,
+spikes heat, and summons IR. Run `vulnscan` first — it flags honeypots before you commit.
+
+### Botnet as a strategy layer
+- **Passive income:** every installed C2 node quietly mines coin and scrubs background
+  heat each turn.
+- **Pivoting:** stand beside a node and type `pivot` to tunnel a hack to a *distant*
+  terminal (within 8 tiles) without walking there — at a success penalty.
+
+### Environmental hacking
+Rooting certain control systems now changes the world for a time:
+- **cameras** → patrols are blinded (reduced sight) for 30 turns
+- **power** → the grid destabilizes; patrols freeze in place for 25 turns
+- **alarms** → being spotted won't raise heat for 30 turns
+
+Active effects show in the sidebar and the inventory's effects list.
+
+### Exploit chains, branches & cooldowns
+- In the hack menu, press **`Tab`** to switch the **exploit branch** — e.g. *balanced*
+  (crack the password, gated on `exploit`) vs *ntlm relay* (`force_auth`, gated on `creds`).
+- Deployed modules go on a short **cooldown**, so spraying your whole toolkit isn't optimal —
+  be surgical.
+
+### Contracts & street cred
+Three side-**contracts** roll each run (root N terminals, craft N modules, install N C2
+nodes). Completing them pays coin and raises **street cred**. High cred makes guards overlook
+you; low cred (from violence and tripped honeypots) makes them jumpy. View them with `n` or
+the `contracts` command.
+
+### Meta-progression, run summary & daily seed
+- **Run summary:** press `=` any time, or see the full breakdown on the win screen.
+- **Meta-progression:** winning carries a module over to your next run, stored in a
+  gitignored `.arthack_save.json`.
+- **Daily seed:** `--daily` gives everyone the same dungeon today and records your best score.
+- **Tutorial terminal:** the start room always has a guaranteed, un-failable terminal to
+  teach the module-selection flow.
 
 ---
 
@@ -212,6 +274,7 @@ V   Chest (loot)        &   Anvil
 ^   Gem (loot)          <   Stairs / passage
 
 Uppercase letters = enemies and NPCs
+B   SOC incident-response unit (hunts your rooted terminals)
 ```
 
 ---

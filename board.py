@@ -207,10 +207,19 @@ class Board:
 
     # -- lookups ---------------------------------------------------------
     def item_at(self, x: int, y: int) -> Item | None:
-        for it in self.items.values():
+        for it in reversed(list(self.items.values())):
             if it.x == x and it.y == y:
                 return it
         return None
+
+    def _items_at(self, x: int, y: int) -> list[Item]:
+        return [it for it in self.items.values() if it.x == x and it.y == y]
+
+    def _refresh_item_glyph(self, x: int, y: int) -> None:
+        if self._items_at(x, y):
+            self.setc(x, y, self._items_at(x, y)[-1].char)
+        elif self.get(x, y) in ITEM_CHARS:
+            self.setc(x, y, ".")
 
     def entity_at(self, x: int, y: int) -> Entity | None:
         for e in self.entities.values():
@@ -228,8 +237,7 @@ class Board:
     def remove_id(self, ident: str) -> str | None:
         if ident in self.items:
             it = self.items.pop(ident)
-            if self.get(it.x, it.y) in ITEM_CHARS:
-                self.setc(it.x, it.y, ".")
+            self._refresh_item_glyph(it.x, it.y)
             return f"the {it.name}"
         if ident in self.entities:
             e = self.entities.pop(ident)
@@ -263,7 +271,7 @@ class Board:
         it.hack_bonus = max(0, int(hack_bonus))
         self.items[it.id] = it
         if self.get(x, y) not in BLOCKING:
-            self.setc(x, y, it.char)
+            self._refresh_item_glyph(x, y)
         return it
 
     def add_entity(self, x: int, y: int, char: str, name: str, desc: str = "",
@@ -729,7 +737,24 @@ class Board:
                 cells = self._floor_cells_of(start_room)
                 if cells:
                     self.px, self.py = cells[0]
+            self._place_tutorial_terminal(start_room)
         self.dungeon_generated = True
+
+    def _place_tutorial_terminal(self, room) -> None:
+        """A guaranteed, un-failable terminal in the start room to teach hacking."""
+        cells = [c for c in self._floor_cells_of(room)
+                 if c != (self.px, self.py) and not self.specials.get(c)]
+        if not cells:
+            return
+        # Prefer a cell adjacent to the player so it's seen immediately.
+        adj = [c for c in cells
+               if abs(c[0] - self.px) + abs(c[1] - self.py) <= 2]
+        x, y = (adj or cells)[0]
+        self.add_terminal(x, y, "CastleNet-TUTORIAL", "doors", tier=1)
+        spec = self.specials.get((x, y))
+        if spec:
+            spec["tutorial"] = True
+            spec["honeypot"] = False
 
     def _reset_for_level(self) -> None:
         self.grid = [[VOID] * self.width for _ in range(self.height)]
@@ -1409,10 +1434,16 @@ class Board:
             ssid = f"CastleNet-{level_num}-{i + 1}"
             tier = 1 + (level_num // 2)
             self.add_terminal(x, y, ssid, control, tier=tier)
+            # ~12% of terminals are honeypots: hacking them burns you instead of
+            # granting control. A vulnscan reveals the trap before you commit.
+            if random.random() < 0.12:
+                spec = self.specials.get((x, y))
+                if spec:
+                    spec["honeypot"] = True
             terminal_specs.append((x, y, ssid, tier))
 
         for tx, ty, ssid, tier in terminal_specs:
-            self._wire_terminal_security(tx, ty, ssid, tier)
+            self._wire_terminal_security(tx, ty, ssid, tier, level_num)
 
         # One shop per level with level-appropriate stock.
         if level_num == 0:
@@ -1490,20 +1521,38 @@ class Board:
                 chest_loot = [random_loot() for _ in range(random.randint(3, 5))]
                 self.add_loot_chest(cx, cy, chest_loot)
 
-    def _wire_terminal_security(self, tx: int, ty: int, ssid: str, tier: int) -> None:
+    def _wire_terminal_security(self, tx: int, ty: int, ssid: str, tier: int,
+                                level_num: int) -> None:
         """Bind nearby locked doors and chest caches to a specific terminal ssid."""
         room = self.room_at(tx, ty)
         if not room:
             return
 
+        start_room = self.rooms.get(f"l{level_num}r0_0")
+
+        def room_distance(src: Room | None, dst: Room | None) -> int:
+            if not src or not dst:
+                return -1
+            sx = src.x0 + src.w // 2
+            sy = src.y0 + src.h // 2
+            dx = dst.x0 + dst.w // 2
+            dy = dst.y0 + dst.h // 2
+            return abs(sx - dx) + abs(sy - dy)
+
+        terminal_distance = room_distance(start_room, room)
+
         # Never lock-link doors in the same room as the terminal.
         # This keeps the terminal accessible before using it.
-        candidate_doors = [((dx, dy), info)
-                           for (dx, dy), info in self.doors.items()
-                           if info.get("room") != room.id
-                           and abs(dx - tx) + abs(dy - ty) <= 20
-                           and not info.get("explored", False)]
-        if not candidate_doors:
+        if start_room:
+            candidate_doors = [((dx, dy), info)
+                               for (dx, dy), info in self.doors.items()
+                               if info.get("room") != room.id
+                               and abs(dx - tx) + abs(dy - ty) <= 20
+                               and not info.get("explored", False)
+                               and room_distance(start_room,
+                                                 self.rooms.get(info.get("room", "")))
+                                   > terminal_distance]
+        else:
             candidate_doors = [((dx, dy), info)
                                for (dx, dy), info in self.doors.items()
                                if info.get("room") != room.id
